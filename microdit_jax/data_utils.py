@@ -19,6 +19,7 @@ class config:
     vaescale_factor = 0.13025
     batch_size = 128
     img_size = 256
+    patch_size = (4, 4)
     lr = 1e-4
     mask_ratio = 0.75
     epochs = 5

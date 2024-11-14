@@ -6,14 +6,15 @@ from jax import (
 )
 from flax import nnx
 from tqdm.auto import tqdm
+from functools import partial
 from diffusers import AutoencoderKL
 from .data_utils import config, train_loader, random_mask, apply_mask
 from .microdit import MicroDiT 
-
+from .rf_sampler import RectFlow
 
 num_devices = jax.device_count()
 devices = jax.devices()
-print(f'found JAX devices => {devices}')
+print(f'found {num_devices} JAX devices => {devices}')
 for device in devices:
     print(f'{device} \n')
 
@@ -21,15 +22,15 @@ for device in devices:
 model = MicroDiT(
     inchannels=3, patch_size=(4, 4), 
     embed_dim=1024, num_layers=12,
-    attn_heads=6, mlp_dim=1024,
+    attn_heads=6, mlp_dim= 4*1024,
     caption_embed_dim=1024
 )
+rf_engine = RectFlow(model)
 
 vae = AutoencoderKL.from_pretrained(config.vae_id).to(device)
-optimizer = nnx.Optimizer(model, optax.adamw(learning_rate=config.lr))
+optimizer = nnx.Optimizer(rf_engine.model, optax.adamw(learning_rate=config.lr))
 
 # def preprocess_image(image_array):
-    
 
 def wandb_logger(key: str, project_name, run_name):  # wandb logger
     # initilaize wandb
@@ -38,12 +39,16 @@ def wandb_logger(key: str, project_name, run_name):  # wandb logger
 
 
 def loss_func(model, batch):
-    img_latents, text_encoding = batch
-    logits = model(img_latents, text_encoding)
+    img_latents, label = batch
+    bs, channels, height, width = img_latents.shape
+    print(img_latents.shape)
+    
+    img_latents = img_latents * config.vaescale_factor
+    mask = random_mask(bs, height, width, patch_size=config.patch_size, mask_ratio=config.mask_ratio).to_device(img_latents.device)
+    loss = model(img_latents, label, mask)
+    # loss = optax.squared_error(img_latents, logits).mean()
 
-    loss = optax.squared_error(img_latents, logits).mean()
-
-    return loss, logits
+    return loss
 
 
 @nnx.jit
@@ -51,8 +56,8 @@ def train_step(model, optimizer, batch):
     gradfn = nnx.value_and_grad(loss_func, has_aux=True)
     (loss, logits), grads = gradfn(model, batch)
     optimizer.update(grads)
-
     return loss
+
 
 def sample_images(model, vae, noise, embeddings):
     # Use the stored embeddings
@@ -64,10 +69,10 @@ def sample_images(model, vae, noise, embeddings):
     return sampled_images
 
 
-def trainer(model=model, optimizer=optimizer, train_loader=train_loader):
+def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
     epochs = 1
     train_loss = 0.0
-    model.train()
+    model.model.train()
     # wandb_logger(
     #     key=None,
     #     model=model,
@@ -90,5 +95,5 @@ def trainer(model=model, optimizer=optimizer, train_loader=train_loader):
 
 
 trainer()
-wandb.finish()
+# wandb.finish()
 print("microdit test training in JAX")

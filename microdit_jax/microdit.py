@@ -7,7 +7,8 @@ from microdit_jax.data_utils import add_masked_patches, config, remove_masked_pa
 from .md_layers import (
     PoolMLP, SelfAttention, SimpleMLP, TimestepEmbedder,
     TransformerEncoderBlock, CrossAttention,
-    DiTBackbone, PatchEmbed, CaptionEmbedder, get_2d_sincos_pos_embed
+    DiTBackbone, PatchEmbed, CaptionEmbedder, get_2d_sincos_pos_embed,
+    LabelEmbedder
 )
 
 rngs = nnx.Rngs(3)
@@ -37,7 +38,7 @@ class MicroDiT(nnx.Module):
         attn_heads, mlp_dim,
         caption_embed_dim, num_experts=4,
         active_experts=2, dropout=0.1,
-        patchmix_layers=2, rngs=rngs    
+        patchmix_layers=2, rngs=rngs, num_classes=10
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -48,6 +49,7 @@ class MicroDiT(nnx.Module):
         # conditioning layers
         self.time_embedder = TimestepEmbedder(embed_dim)
         self.cap_embedder = CaptionEmbedder(caption_embed_dim, embed_dim)
+        self.label_embedder = LabelEmbedder(num_classes=num_classes, hidden_size=embed_dim)
         self.cond_attention = CrossAttention(attn_heads, embed_dim, caption_embed_dim, rngs=rngs)
         self.cond_mlp = SimpleMLP(embed_dim)
 
@@ -73,11 +75,12 @@ class MicroDiT(nnx.Module):
         pos_embed = jnp.broadcast_to(pos_embed, (bsize, -1, -1))
         x = x + pos_embed
 
-        caption_embed = self.cap_embedder(y_cap) # (b, embdim)
+        # cond_embed = self.cap_embedder(y_cap) # (b, embdim)
+        cond_embed = self.label_embedder(y_cap)
         time_embed = self.time_embedder(t)
         time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=0)
 
-        mha_out = self.cond_attention(time_embed_unsqueeze, caption_embed).squeeze(axis=1)
+        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed).squeeze(axis=1)
         mlp_out = self.cond_mlp(mha_out)
 
         # pooling the conditions
@@ -91,7 +94,6 @@ class MicroDiT(nnx.Module):
         x = self.patch_mixer(x)
 
         if mask is not None:
-            # TODO add mask removal
             x = remove_masked_patches(x, mask)
 
         mlp_out_us = jnp.expand_dims(mlp_out, axis=1) # unqueezed mlp output
@@ -99,7 +101,7 @@ class MicroDiT(nnx.Module):
 
         x = x + cond 
 
-        x = self.ditbackbone(x, time_embed, caption_embed)
+        x = self.ditbackbone(x, time_embed, cond_embed)
 
         x = self.final_linear(x)
 
