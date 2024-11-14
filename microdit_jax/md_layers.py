@@ -317,6 +317,220 @@ class SparseMoEBlock(nnx.Module):
         pass
 
 
+# self attention block
+class SelfAttention(nnx.Module):
+    def __init__(self, attn_heads, embed_dim, rngs: nnx.Rngs, drop=0.1):
+        super().__init__()
+        self.attn_heads = attn_heads
+        self.head_dim = embed_dim // attn_heads
+
+        linear_init = nnx.initializers.xavier_uniform()
+        linear_bias_init = nnx.initializers.constant(0)
+
+        self.q_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init, kernel_init=linear_init)
+        self.k_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.v_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+
+        self.outproject = nnx.Linear(embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init)
+        self.dropout = nnx.Dropout(drop, rngs=rngs)
+
+    def __call__(self, x_input: jax.Array) -> jax.Array:
+        q = self.q_linear(x_input)
+        k = self.k_linear(x_input)
+        v = self.v_linear(x_input)
+
+        q, k, v = map(
+            lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
+        )
+
+        qk = q @ jnp.matrix_transpose(k)
+        attn_logits = qk / math.sqrt(self.head_dim)  # attention computation
+
+        attn_score = nnx.softmax(attn_logits, axis=-1)
+        attn_output = attn_score @ v
+
+        output = rearrange(attn_output, "b h l d -> b l (h d)")
+        output = self.dropout(self.outproject(output))
+        print(f"attn out shape => {output.shape}")
+        return output
+
+
+class CrossAttention(nnx.Module):
+    def __init__(self, attn_heads, embed_dim, cond_dim, rngs: nnx.Rngs, drop=0.1):
+        super().__init__()
+        self.attn_heads = attn_heads
+        self.head_dim = embed_dim // attn_heads
+
+        linear_init = nnx.initializers.xavier_uniform()
+        linear_bias_init = nnx.initializers.constant(0)
+
+        self.q_linear = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+        )
+        
+        self.k_linear = nnx.Linear(cond_dim, embed_dim, rngs=rngs)
+        self.v_linear = nnx.Linear(cond_dim, embed_dim, rngs=rngs)
+
+        self.outproject = nnx.Linear(
+            embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init
+        )
+        self.dropout = nnx.Dropout(drop, rngs=rngs)
+
+    def __call__(self, x_input: jax.Array, y_cond: Array) -> jax.Array:
+        q = self.q_linear(x_input)
+        k = self.k_linear(y_cond)
+        v = self.v_linear(y_cond)
+
+        q, k, v = map(
+            lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
+        )
+
+        qk = q @ jnp.matrix_transpose(k)
+        attn_logits = qk / math.sqrt(self.head_dim)  # attention computation
+
+        attn_score = nnx.softmax(attn_logits, axis=-1)
+        attn_output = attn_score @ v
+
+        output = rearrange(attn_output, "b h l d -> b l (h d)")
+        output = self.dropout(self.outproject(output))
+        print(f"attn out shape => {output.shape}")
+        return output
+
+
+###############
+# DiT blocks_ #
+###############
+
+class DiTBlock(nnx.Module):
+    def __init__(self, hidden_size=768, num_heads=6):
+        super().__init__()
+        
+        # initializations
+        linear_init = nnx.initializers.xavier_uniform()
+        lnbias_init = nnx.initializers.constant(0)
+        lnweight_init = nnx.initializers.constant(0)
+        
+        self.norm_1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init)
+        self.attention = SelfAttention(num_heads, hidden_size, rngs=rngs)
+        self.norm_2 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        
+        self.adaln_linear = nnx.Linear(
+            hidden_size, 6 * hidden_size, 
+            use_bias=True, bias_init=linear_init, 
+            rngs=rngs, kernel_init=lnweight_init
+        )
+        self.moe_block = SparseMoEBlock(hidden_size)
+        
+        
+    def __call__(self, x_img: Array):
+        x_input = self.adaln_linear(nnx.silu(x_img))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.array_split(x_input, 6)
+        
+        attn_mod_x = self.attention(modulate(self.norm_1(x_input), shift_msa, scale_msa))
+        x = x_input + jnp.expand_dims(gate_msa, 1) * attn_mod_x
+        
+        mlp_mod_x = self.moe_block(modulate(self.norm_2(x), shift_mlp, scale_mlp))
+        x = x + jnp.expand_dims(gate_mlp, 1) * mlp_mod_x
+        
+        return x
+
+
+class FinalMLP(nnx.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        # linear_init = nnx.initializers.xavier_uniform()
+        linear_init = nnx.initializers.constant(0)
+        
+        self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.linear = nnx.Linear(
+            hidden_size, patch_size*patch_size*out_channels, 
+            rngs=rngs, kernel_init=linear_init, 
+            bias_init=linear_init
+        )
+        self.adaln_linear = nnx.Linear(hidden_size, 2 * hidden_size, rngs=rngs, kernel_init=linear_init, bias_init=linear_init)
+        
+    def __call__(self, x_input: Array, cond: Array):
+        linear_cond = nnx.silu(self.adaln_linear(cond))
+        shift, scale = jnp.array_split(linear_cond, 2, axis=1)
+        
+        x = modulate(self.norm_final(x_input), shift, scale)
+        x = self.linear(x)
+        
+        return
+
+
+class DiTBackbone(nnx.Module):
+    def __init__(
+        self,
+        patch_size=4,
+        in_channels=4,
+        hidden_size=1024,
+        depth=8,
+        attn_heads=6,
+        learn_sigma=True
+    ):
+        super().__init__()
+        self.learn_sigma = learn_sigma
+        self.in_chan = in_channels
+        self.out_channels = in_channels * 2 if learn_sigma else in_channels
+        self.patch_size = patch_size
+        self.attn_heads = attn_heads
+
+        self.img_embedder = PatchEmbed(img_size=img_size, in_chan=in_channels, embed_dim=hidden_size)
+        self.time_embedder = TimestepEmbedder(hidden_size)
+
+        num_patches = self.img_embedder.num_patches
+
+        self.pos_embed = nnx.Param(jnp.zeros(shape=(1, num_patches, hidden_size)))
+        pos_embed = get_2d_sincos_pos_embed(self.pos_embed.shape[-1], int(self.img_embedder.num_patches ** 0.5))
+        sincos2d_data = jnp.expand_dims(pos_embed.astype(jnp.float32), axis=0)
+        self.pos_embed.copy_from(sincos2d_data) # type: ignore
+
+        dit_blocks = [DiTBlock(hidden_size, num_heads=attn_heads) for _ in range(depth)]
+        self.dit_layers = nnx.Sequential(*dit_blocks)
+        self.final_mlp = FinalMLP(hidden_size, patch_size, self.out_channels)
+
+    def unpatchify(self, x: Array) -> Array:
+        c = self.out_channels
+        p = self.img_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = jnp.reshape(x, shape=(x.shape[0], h, w, p, p, c))
+        x = jnp.einsum('nhwpqc->nchpwq', x)
+        img = jnp.reshape(x, shape=(x.shape[0], c, h*p, w*p))
+
+        return img
+
+    def __call__(self, x: Array, t: Array, y_cond: Array):
+        x = self.img_embedder(x) + self.pos_embed
+        t_embed = self.time_embedder(t)
+
+        cond = t_embed + y_cond
+        x = self.dit_layers(x, cond)
+        x = self.final_mlp(x, cond) # type: ignore
+        x = self.unpatchify(x)
+
+        return x
+
+    def cfg_forward(self, x_img, t, y_cond, cfg_scale):
+        half = x_img[: len(x_img) // 2]
+        combined = jnp.concat([half, half], axis=0)
+        model_out = self.__call__(combined, t, y_cond)
+
+        eps, rest = model_out[:, :3], model_out[:, 3:]
+        cond_eps, uncond_eps = jnp.split(eps, len(eps) // 2, axis=0)
+
+        half_eps = uncond_eps + cfg_scale * (cond_eps - uncond_eps)
+        eps = jnp.concat([half_eps, half_eps], axis=0)
+        cfg_out = jnp.concat([eps, rest], axis=1)
+
+        return cfg_out 
+
 
 # Adapted from https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
 
