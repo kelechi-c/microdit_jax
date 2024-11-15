@@ -172,11 +172,13 @@ class PoolMLP(nnx.Module):
 
 #### MoE Gate
 class MoEGate(nnx.Module):
-    def __init__(self, embed_dim, num_experts=8, experts_per_token=2, aux_loss_alpha=0.01):
+    def __init__(
+        self, embed_dim, num_experts=8, experts_per_token=2, aux_loss_alpha=0.01
+    ):
         super().__init__()
         self.top_k = experts_per_token
         self.routed_exoerts = num_experts
-        self.score_func = 'softmax'
+        self.score_func = "softmax"
         self.alpha = aux_loss_alpha
         self.seq_aux = False
 
@@ -191,45 +193,53 @@ class MoEGate(nnx.Module):
         bsize, seq_len, h = hidden_states.shape
         # gating score
         hidden_states = jnp.reshape(hidden_states, (-1, h))
-        logits = jnp.dot(hidden_states, self.weight['Array'])
+        logits = jnp.dot(hidden_states, self.weight["Array"])
         scores = nnx.softmax(logits, axis=-1)
 
-        topk_idx, topk_weight = jnp_topk(scores, k=self.top_k)
-            
+        topk_idx, topk_weight = jax.lax.top_k(scores, k=self.top_k)
+
         # normalize to sum to 1
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
             topk_weight = topk_weight / denominator
-        
+
         # expert level computation of auxiliary loss
         # always compute topk based on naive greedy topk method
         if self.train and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
             aux_loss = 0.0
-            
+
             topk_idx_for_auxloss = jnp.reshape(topk_idx, (bsize, -1))
             if self.seq_aux:
                 scores_for_seq_aux = jnp.reshape(scores_for_aux, (bsize, seq_len, -1))
-                ce = jnp.zeros((bsize, self.routed_exoerts), device=hidden_states.device)
-                ones_add = jnp.ones((bsize, seq_len*aux_topk))
+                ce = jnp.zeros(
+                    (bsize, self.routed_exoerts), device=hidden_states.device
+                )
+                ones_add = jnp.ones((bsize, seq_len * aux_topk))
                 ce = jnp.add.at(ce, 1, ones_add)
-                ce /= seq_len * aux_topk / self.routed_exoerts 
-                
-                aux_loss = (ce * scores_for_seq_aux.mean(axis=1)).sum(axis=1).mean() * self.alpha
-            
+                ce /= seq_len * aux_topk / self.routed_exoerts
+
+                aux_loss = (ce * scores_for_seq_aux.mean(axis=1)).sum(
+                    axis=1
+                ).mean() * self.alpha
+
             else:
-                mask_ce = nnx.one_hot(jnp.reshape(topk_idx_for_auxloss, (-1)), num_classes=self.routed_exoerts)
+                mask_ce = nnx.one_hot(
+                    jnp.reshape(topk_idx_for_auxloss, (-1)),
+                    num_classes=self.routed_exoerts,
+                )
                 ce = mask_ce.astype(jnp.float32).mean(0)
                 pi = scores_for_aux.mean()
                 fi = ce * self.routed_exoerts
                 aux_loss = (pi * fi).sum() * self.alpha
-                
+
         else:
             aux_loss = None
-                
-        return topk_idx, topk_weight, aux_loss
 
+        print(f"gate shape => {topk_weight.shape}")
+
+        return topk_idx, topk_weight, aux_loss
 
 # mixture of experts MLP layer
 class MoEMLP(nnx.Module):
@@ -279,40 +289,41 @@ class SparseMoEBlock(nnx.Module):
         self.router_gate = MoEGate(embed_dim, num_experts)
         self.n_shared_experts = 2
         self.training = train
-         
+
         if self.n_shared_experts is not None:
             intermediate_size = embed_dim * self.n_shared_experts
             self.shared_experts = MoEMLP(hidden_size=embed_dim, intersize=intermediate_size)
-            
+
     def __call__(self, hidden_states: Array):
         identity = hidden_states
         og_shape = hidden_states.shape
         topk_idx, topk_weight, aux_loss = self.router_gate(hidden_states)
         y = jrand.normal(rkey, shape=og_shape) # init as random array
-        
+
         hidden_states = jnp.reshape(hidden_states, (-1, hidden_states.shape[1:]))
         flat_topk_idx = jnp.reshape(topk_idx, shape=(-1))
-        
+
         if self.train:
             hidden_states = jnp.repeat(hidden_states, repeats=self.experts_pertoken, axis=0)
             y = jnp.empty_like(hidden_states, dtype=hidden_states.dtype)
-            
+
             for k, expert in enumerate(self.expert_models):
                 y[flat_topk_idx == k] = expert(hidden_states[flat_topk_idx == k]).astype(hidden_states.dtype) # type: ignore
-            
+
             y = jnp.reshape(y, shape=(*topk_weight.shape, -1)) * jnp.expand_dims(topk_weight, axis=-1).sum(axis=1)
             y = jnp.reshape(y, shape=(og_shape))
-            #TODO: Auxiliary loss add
-        
+            # TODO: Auxiliary loss add
+
         else:
             y = None
-        
+
         if self.shared_experts is not None:
             y = y + self.shared_experts(identity) # type: ignore
-        
+
+        print(f"sparse moe shape =>{y.shape}")
+
         return y
-    
-    
+
     def moe_infer(self, x_input):
         pass
 
