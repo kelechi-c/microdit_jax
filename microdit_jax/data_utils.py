@@ -77,32 +77,33 @@ def apply_mask(x: Array, mask, patch_size):
     bs, c, h, w = x.shape
     numpatch_h = h // patch_size[0]
     numpatch_w = w // patch_size[1]
-    
+
     mask = jnp.reshape(mask, shape=(bs, numpatch_h, numpatch_w))
-    
+
     mask = jnp.expand_dims(mask, axis=1)
     mask = jnp.tile(mask, reps=(1, 1, patch_size[0], patch_size[1]))
     mask = jnp.reshape(mask, shape=(bs, 1, h, w))
-    
+
     x_masked = x * mask
-    
+
     return x_masked
 
 
 def random_mask(bs, height, width, patch_size, mask_ratio):
     num_patches = (height // patch_size[0]) * (width // patch_size[1])
     num_patches_to_mask = int(num_patches * mask_ratio)
-    
+
     rand_array = jrand.normal(randkey, shape=(bs, num_patches))
     indices = jnp.argsort(rand_array, axis=1)
-    
+
     mask = jnp.ones(shape=(bs, num_patches))
-    
+
     batch_mask_array = jnp.expand_dims(jnp.arange(bs), axis=1)
-    mask[batch_mask_array, indices[:, :num_patches_to_mask]] = 0
-    
+    # mask[batch_mask_array, indices[:, :num_patches_to_mask]] = 0
+    new_mask = mask.at[batch_mask_array, indices[:, :num_patches_to_mask]].set(0)
+    mask = new_mask
     mask = jnp.reshape(mask, shape=(bs, num_patches))
-    
+
     return mask
 
 
@@ -193,16 +194,28 @@ class ImageClassData(IterableDataset):
 
     def __iter__(self):
         for sample in self.dataset:
-            image = sample["img_url"]  # type: ignore
+            image = sample["img"]  # type: ignore
             image = load_image(image)
-            img_latents = vae.encode(image)
-            img_latents = img_latents.numpy()
+            # img_latents = vae.encode(torch.tensor(image))
+            # img_latents = img_latents.
 
             image = jnp.array(image)
-            label = jnp.array(sample['label'])
+            label = jnp.array(sample["label"])
 
             yield image, label
 
 
+def jax_collate(batch):
+    images, labels = zip(*batch)
+    batch = (jnp.array(images), jnp.array(labels))
+    batch = jax.tree_util.tree_map(jnp.array, batch)
+
+    return batch
+
+
 dataset = ImageClassData()
-train_loader = DataLoader(dataset, batch_size=config.batch_size)
+
+train_loader = DataLoader(dataset, batch_size=4, collate_fn=jax_collate)
+
+iv = next(iter(train_loader))
+iv[0].shape
