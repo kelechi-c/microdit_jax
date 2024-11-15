@@ -33,24 +33,37 @@ class PatchMixer(nnx.Module):
 class MicroDiT(nnx.Module):
     def __init__(
         self,
-        inchannels, patch_size,
-        embed_dim, num_layers,
-        attn_heads, mlp_dim,
-        caption_embed_dim, num_experts=4,
-        active_experts=2, dropout=0.1,
-        patchmix_layers=2, rngs=rngs, num_classes=10
+        inchannels,
+        patch_size,
+        embed_dim,
+        num_layers,
+        attn_heads,
+        mlp_dim,
+        cond_embed_dim,
+        num_experts=4,
+        active_experts=2,
+        dropout=0.1,
+        patchmix_layers=2,
+        rngs=rngs,
+        num_classes=10,
     ):
         super().__init__()
         self.patch_size = patch_size
         self.embed_dim = embed_dim
 
-        self.patch_embedder = PatchEmbed(rngs=rngs, patch_size=patch_size, in_chan=inchannels, embed_dim=embed_dim)
+        self.patch_embedder = PatchEmbed(
+            rngs=rngs, patch_size=patch_size, in_chan=inchannels, embed_dim=embed_dim
+        )
 
         # conditioning layers
         self.time_embedder = TimestepEmbedder(embed_dim)
-        self.cap_embedder = CaptionEmbedder(caption_embed_dim, embed_dim)
-        self.label_embedder = LabelEmbedder(num_classes=num_classes, hidden_size=embed_dim)
-        self.cond_attention = CrossAttention(attn_heads, embed_dim, caption_embed_dim, rngs=rngs)
+        self.cap_embedder = CaptionEmbedder(cond_embed_dim, embed_dim)
+        self.label_embedder = LabelEmbedder(
+            num_classes=num_classes, hidden_size=embed_dim, drop=dropout
+        )
+        self.cond_attention = CrossAttention(
+            attn_heads, embed_dim, cond_embed_dim, rngs=rngs
+        )
         self.cond_mlp = SimpleMLP(embed_dim)
 
         # pooling layer
@@ -59,13 +72,20 @@ class MicroDiT(nnx.Module):
         self.linear = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
 
         self.patch_mixer = PatchMixer(embed_dim, attn_heads, patchmix_layers)
-        self.ditbackbone = DiTBackbone(patch_size=patch_size, in_channels=inchannels, hidden_size=embed_dim, depth=num_layers)
+        self.ditbackbone = DiTBackbone(
+            patch_size=patch_size,
+            in_channels=inchannels,
+            hidden_size=embed_dim,
+            depth=num_layers,
+        )
 
         self.outlin_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.final_linear = nnx.Linear(embed_dim, patch_size[0] * patch_size[1] * inchannels, rngs=rngs)
+        self.final_linear = nnx.Linear(
+            embed_dim, patch_size[0] * patch_size[1] * inchannels, rngs=rngs
+        )
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
-        bsize, channels, height, width = x.shape
+        bsize, height, width, channels = x.shape
         psize_h, psize_w = self.patch_size
 
         x = self.patch_embedder(x)
@@ -88,7 +108,9 @@ class MicroDiT(nnx.Module):
         pool_out = jnp.expand_dims((pool_out + time_embed), axis=1)
 
         cond_signal = jnp.expand_dims(self.linear(mlp_out), axis=1)
-        cond_signal = jnp.broadcast_to((cond_signal + pool_out), shape=(-1, x.shape[1], -1))
+        cond_signal = jnp.broadcast_to(
+            (cond_signal + pool_out), shape=(-1, x.shape[1], -1)
+        )
 
         x = x + cond_signal
         x = self.patch_mixer(x)
@@ -96,10 +118,10 @@ class MicroDiT(nnx.Module):
         if mask is not None:
             x = remove_masked_patches(x, mask)
 
-        mlp_out_us = jnp.expand_dims(mlp_out, axis=1) # unqueezed mlp output
+        mlp_out_us = jnp.expand_dims(mlp_out, axis=1)  # unqueezed mlp output
         cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(-1, x.shape[1], -1))
 
-        x = x + cond 
+        x = x + cond
 
         x = self.ditbackbone(x, time_embed, cond_embed)
 
@@ -115,7 +137,7 @@ class MicroDiT(nnx.Module):
 
     # ahhhhhhhh, yess, full model
     # wed_nov_13, 4:49
-    
+
     def sample(self, z_latent, cond, sample_steps=50, cfg=2.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
@@ -127,7 +149,11 @@ class MicroDiT(nnx.Module):
 
         for i in range(sample_steps, 0, -1):
             t = i / sample_steps
-            t = jnp.array([t] * b_size).to_device(z_latent.device).astype(z_latent.dtype)
+            t = (
+                jnp.array([t] * b_size)
+                .to_device(z_latent.device)
+                .astype(z_latent.dtype)
+            )
 
             vc = self(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
@@ -137,6 +163,16 @@ class MicroDiT(nnx.Module):
             z = z_latent - dt * vc
             images.append(z)
 
-        return (images[-1] / config.vaescale_factor)
-    
-## sampling nov14_0501am
+        return images[-1] / config.vaescale_factor
+
+
+randin = jrand.normal(randkey, (1, 4, 32, 32))
+microdit = MicroDiT(
+    inchannels=3,
+    patch_size=(4, 4),
+    embed_dim=1024,
+    num_layers=4,
+    attn_heads=6,
+    mlp_dim=4 * 1024,
+    cond_embed_dim=768,
+)
