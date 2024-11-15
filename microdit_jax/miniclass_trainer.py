@@ -1,9 +1,4 @@
-import jax, math, os, wandb, time, optax, torchvision
-from jax import (
-    Array, 
-    numpy as jnp,
-    random as jrand
-)
+import jax, math, os, wandb, time, gc, optax, torchvision
 from flax import nnx
 from tqdm.auto import tqdm
 from functools import partial
@@ -19,18 +14,22 @@ for device in devices:
     print(f'{device} \n')
 
 
-model = MicroDiT(
-    inchannels=3, patch_size=(4, 4), 
-    embed_dim=1024, num_layers=12,
-    attn_heads=6, mlp_dim= 4*1024,
-    caption_embed_dim=1024
+microdit = MicroDiT(
+    inchannels=3,
+    patch_size=(4, 4),
+    embed_dim=1024,
+    num_layers=4,
+    attn_heads=6,
+    mlp_dim=4 * 1024,
+    cond_embed_dim=768,
 )
-rf_engine = RectFlow(model)
+rf_engine = RectFlow(microdit)
+graph, state = nnx.split(rf_engine)
+n_params = sum([p.size for p in jax.tree.leaves(state)])
+print(f"number of parameters: {n_params/1e6:.3f}M")
 
-vae = AutoencoderKL.from_pretrained(config.vae_id).to(device)
-optimizer = nnx.Optimizer(rf_engine.model, optax.adamw(learning_rate=config.lr))
+optimizer = nnx.Optimizer(rf_engine, optax.adamw(learning_rate=config.lr))
 
-# def preprocess_image(image_array):
 
 def wandb_logger(key: str, project_name, run_name):  # wandb logger
     # initilaize wandb
@@ -40,11 +39,14 @@ def wandb_logger(key: str, project_name, run_name):  # wandb logger
 
 def loss_func(model, batch):
     img_latents, label = batch
-    bs, channels, height, width = img_latents.shape
+    bs, height, width, channels = img_latents.shape
     print(img_latents.shape)
-    
+
     img_latents = img_latents * config.vaescale_factor
-    mask = random_mask(bs, height, width, patch_size=config.patch_size, mask_ratio=config.mask_ratio).to_device(img_latents.device)
+    mask = random_mask(
+        bs, height, width, patch_size=config.patch_size, mask_ratio=config.mask_ratio
+    )
+    print(f"mask shape {mask.shape}")
     loss = model(img_latents, label, mask)
     # loss = optax.squared_error(img_latents, logits).mean()
 
@@ -56,13 +58,16 @@ def train_step(model, optimizer, batch):
     gradfn = nnx.value_and_grad(loss_func, has_aux=True)
     (loss, logits), grads = gradfn(model, batch)
     optimizer.update(grads)
+    jax.clear_caches()
+    gc.collect()
+    
     return loss
 
 
 def sample_images(model, vae, noise, embeddings):
     # Use the stored embeddings
     sampled_latents = model.sample(noise, embeddings)
-    
+
     # Decode latents to images
     sampled_images = vae.decode(sampled_latents).sample
     # images = sample_images
