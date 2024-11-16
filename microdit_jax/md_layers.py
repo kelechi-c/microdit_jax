@@ -128,7 +128,8 @@ class LabelEmbedder(nnx.Module):
         return label_embeds
 
 
-class CaptionEmbedder:
+
+class CaptionEmbedder(nnx.Module):
     def __init__(self, cap_embed_dim, embed_dim):
         super().__init__()
         self.linear_1 = nnx.Linear(cap_embed_dim, embed_dim, rngs=rngs)
@@ -154,7 +155,6 @@ class SimpleMLP(nnx.Module):
         return x
 
 
-# Pool + MLP for (MHA + MLP)
 class PoolMLP(nnx.Module):
     def __init__(self, embed_dim):
         super().__init__()
@@ -162,12 +162,17 @@ class PoolMLP(nnx.Module):
         self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
 
     def __call__(self, x: Array) -> Array:
-        x = nnx.avg_pool(x, 1, 1)
+        x = nnx.avg_pool(x, (1,))
+        print(f'avg pool; {x.shape}')
         x = jnp.reshape(x, shape=(x.shape[0], -1))
+        print(f'avg pool rsd {x.shape}')
+
         x = nnx.gelu(self.linear_1(x))
         x = self.linear_2(x)
 
         return x
+
+
 
 
 #### MoE Gate
