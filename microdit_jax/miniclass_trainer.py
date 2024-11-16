@@ -19,10 +19,11 @@ microdit = MicroDiT(
     patch_size=(4, 4),
     embed_dim=1024,
     num_layers=4,
-    attn_heads=6,
-    mlp_dim=4 * 1024,
-    cond_embed_dim=768,
+    attn_heads=8,
+    mlp_dim=1 * 1024,
+    cond_embed_dim=1024,
 )
+
 rf_engine = RectFlow(microdit)
 graph, state = nnx.split(rf_engine)
 n_params = sum([p.size for p in jax.tree.leaves(state)])
@@ -67,17 +68,15 @@ def train_step(model, optimizer, batch):
 def sample_images(model, vae, noise, embeddings):
     # Use the stored embeddings
     sampled_latents = model.sample(noise, embeddings)
-
     # Decode latents to images
     sampled_images = vae.decode(sampled_latents).sample
-    # images = sample_images
     return sampled_images
 
 
 def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
     epochs = 1
     train_loss = 0.0
-    model.model.train()
+    model.train()
     # wandb_logger(
     #     key=None,
     #     model=model,
@@ -91,9 +90,6 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
             train_loss = train_step(model, optimizer, batch)
             print(f"step {step}, loss-> {train_loss.item():.4f}")
             
-            # if step % 100 == 0:
-            #     sample_latents = model.sample()
-
             # wandb.log({"loss": train_loss.item()})
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
