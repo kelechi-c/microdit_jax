@@ -54,6 +54,7 @@ class MicroDiT(nnx.Module):
         self.patch_embedder = PatchEmbed(
             rngs=rngs, patch_size=patch_size, in_chan=inchannels, embed_dim=embed_dim
         )
+        self.num_patches = self.patch_embedder.num_patches
 
         # conditioning layers
         self.time_embedder = TimestepEmbedder(embed_dim)
@@ -85,23 +86,39 @@ class MicroDiT(nnx.Module):
         )
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
-        bsize, height, width, channels = x.shape
+        bsize, channels, height, width = x.shape
         psize_h, psize_w = self.patch_size
 
         x = self.patch_embedder(x)
 
         pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // psize_h)
-        pos_embed = jnp.expand_dims(pos_embed.to_device(x.device), axis=0)
-        pos_embed = jnp.broadcast_to(pos_embed, (bsize, -1, -1))
+        pos_embed = jnp.expand_dims(pos_embed, axis=0)
+        print(f"pos embed sape: {pos_embed.shape}")
+        pos_embed = jnp.broadcast_to(
+            pos_embed, (bsize, pos_embed.shape[1], pos_embed.shape[2])
+        )
+        pos_embed = jnp.reshape(
+            pos_embed, shape=(bsize, self.num_patches, self.embed_dim)
+        )
+        x = jnp.reshape(x, shape=(bsize, self.num_patches, self.embed_dim))
+
+        print(f"pos embed 2 sape: {pos_embed.shape}, x shape {x.shape}")
         x = x + pos_embed
 
         # cond_embed = self.cap_embedder(y_cap) # (b, embdim)
-        cond_embed = self.label_embedder(y_cap)
+        cond_embed = self.label_embedder(y_cap, train=True)
+        cond_embed = jnp.expand_dims(cond_embed, axis=1)
+        print(f"cond embed sape: {cond_embed.shape}")
+
         time_embed = self.time_embedder(t)
         time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=0)
 
-        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed).squeeze(axis=1)
+        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed)  #
+        mha_out = jnp.squeeze(mha_out, axis=1)
+        print(f"mha_out shape: {mha_out.shape}")
+
         mlp_out = self.cond_mlp(mha_out)
+        print(f"mlp_out sape: {mlp_out.shape}")
 
         # pooling the conditions
         pool_out = self.pool_mlp(jnp.expand_dims(mlp_out, axis=2))
@@ -111,6 +128,8 @@ class MicroDiT(nnx.Module):
         cond_signal = jnp.broadcast_to(
             (cond_signal + pool_out), shape=(-1, x.shape[1], -1)
         )
+
+        print(f"cond_signal sape: {cond_signal.shape}")
 
         x = x + cond_signal
         x = self.patch_mixer(x)
@@ -124,14 +143,17 @@ class MicroDiT(nnx.Module):
         x = x + cond
 
         x = self.ditbackbone(x, time_embed, cond_embed)
+        print(f"ditbackbone shape: {x.shape}")
 
         x = self.final_linear(x)
+        print(f"final lin shape: {x.shape}")
 
         # add back masked patches
         if mask is not None:
             x = add_masked_patches(x, mask)
 
         x = self.ditbackbone.unpatchify(x)
+        print(f"unpatched shape: {x.shape}")
 
         return x
 
