@@ -1,3 +1,4 @@
+import flax.linen
 import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
@@ -8,7 +9,7 @@ from .md_layers import (
     PoolMLP, SelfAttention, SimpleMLP, TimestepEmbedder,
     TransformerEncoderBlock, CrossAttention,
     DiTBackbone, PatchEmbed, CaptionEmbedder, get_2d_sincos_pos_embed,
-    LabelEmbedder
+    LabelEmbedder, TransformerBackbone
 )
 
 rngs = nnx.Rngs(3)
@@ -73,17 +74,32 @@ class MicroDiT(nnx.Module):
         self.linear = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
 
         self.patch_mixer = PatchMixer(embed_dim, attn_heads, patchmix_layers)
-        self.ditbackbone = DiTBackbone(
-            patch_size=patch_size,
-            in_channels=inchannels,
-            hidden_size=embed_dim,
-            depth=num_layers,
+
+        self.backbone = TransformerBackbone(
+            embed_dim,
+            embed_dim,
+            embed_dim,
+            num_layers=num_layers,
+            num_heads=attn_heads,
+            mlp_dim=mlp_dim,
         )
 
         self.outlin_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
         self.final_linear = nnx.Linear(
             embed_dim, patch_size[0] * patch_size[1] * inchannels, rngs=rngs
         )
+
+    def unpatchify(self, x: Array) -> Array:
+        c = 3
+        p = self.patch_embedder.patch_size[0]
+        h = w = int(x.shape[1] ** 0.5)
+        assert h * w == x.shape[1]
+
+        x = jnp.reshape(x, shape=(x.shape[0], h, w, p, p, c))
+        x = jnp.einsum("nhwpqc->nchpwq", x)
+        img = jnp.reshape(x, shape=(x.shape[0], c, h * p, w * p))
+
+        return img
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
         bsize, channels, height, width = x.shape
@@ -107,38 +123,48 @@ class MicroDiT(nnx.Module):
 
         # cond_embed = self.cap_embedder(y_cap) # (b, embdim)
         cond_embed = self.label_embedder(y_cap, train=True)
-        cond_embed = jnp.expand_dims(cond_embed, axis=1)
+        cond_embed_unsqueeze = jnp.expand_dims(cond_embed, axis=1)
         print(f"cond embed sape: {cond_embed.shape}")
 
         time_embed = self.time_embedder(t)
-        time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=0)
+        time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=1)
+        print(
+            f"time and cond embed sape: {time_embed.shape}/{time_embed_unsqueeze.shape}, {cond_embed.shape}/{cond_embed_unsqueeze.shape}"
+        )
 
-        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed)  #
-        mha_out = jnp.squeeze(mha_out, axis=1)
+        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed_unsqueeze)  #
         print(f"mha_out shape: {mha_out.shape}")
+        mha_out = mha_out.squeeze(1)
+        print(f"mha_out squeezed: {mha_out.shape}")
 
         mlp_out = self.cond_mlp(mha_out)
         print(f"mlp_out sape: {mlp_out.shape}")
 
         # pooling the conditions
         pool_out = self.pool_mlp(jnp.expand_dims(mlp_out, axis=2))
+        print(f"pool out 1: {pool_out.shape}")
+
         pool_out = jnp.expand_dims((pool_out + time_embed), axis=1)
+        print(f"pool out 2: {pool_out.shape}")
 
         cond_signal = jnp.expand_dims(self.linear(mlp_out), axis=1)
-        cond_signal = jnp.broadcast_to(
-            (cond_signal + pool_out), shape=(-1, x.shape[1], -1)
-        )
+        cond_signal = jnp.broadcast_to((cond_signal + pool_out), shape=(x.shape))
 
-        print(f"cond_signal sape: {cond_signal.shape}")
+        print(f"cond_signal shape: {cond_signal.shape}")
 
         x = x + cond_signal
         x = self.patch_mixer(x)
+        print(f"x patchmix: {x.shape}")
 
         if mask is not None:
             x = remove_masked_patches(x, mask)
+            print(f"x unmasked: {x.shape}")
 
         mlp_out_us = jnp.expand_dims(mlp_out, axis=1)  # unqueezed mlp output
-        cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(-1, x.shape[1], -1))
+        print(f"mlp_out_us: {mlp_out_us.shape}")
+
+        cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
+        print(f"cond: {cond.shape}")
 
         x = x + cond
 
@@ -152,7 +178,7 @@ class MicroDiT(nnx.Module):
         if mask is not None:
             x = add_masked_patches(x, mask)
 
-        x = self.ditbackbone.unpatchify(x)
+        x = self.unpatchify(x)
         print(f"unpatched shape: {x.shape}")
 
         return x
@@ -173,7 +199,7 @@ class MicroDiT(nnx.Module):
             t = i / sample_steps
             t = (
                 jnp.array([t] * b_size)
-                .to_device(z_latent.device)
+                # .to_device(z_latent.device)
                 .astype(z_latent.dtype)
             )
 
@@ -188,13 +214,14 @@ class MicroDiT(nnx.Module):
         return images[-1] / config.vaescale_factor
 
 
-randin = jrand.normal(randkey, (1, 4, 32, 32))
+# randin = jrand.normal(randkey, (1, 4, 32, 32))
+
 microdit = MicroDiT(
     inchannels=3,
     patch_size=(4, 4),
     embed_dim=1024,
     num_layers=4,
-    attn_heads=6,
-    mlp_dim=4 * 1024,
-    cond_embed_dim=768,
+    attn_heads=8,
+    mlp_dim=2 * 1024,
+    cond_embed_dim=1024,
 )
