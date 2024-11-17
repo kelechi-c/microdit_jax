@@ -60,16 +60,26 @@ def save_model(model: nnx.Module, file: str, dtype):
     _, state = nnx.split(model)
     params = state.filter(nnx.Param)
     state_dict = to_state_dict(params)
-    
+
     state_dict = flax.traverse_util.flatten_dict(state_dict, sep='.')
-    
+
     for key in list(state_dict.keys()):
         if not isinstance(state_dict[key], Array):
             state_dict[key] = jnp.array(state_dict[key]) # type: ignore
-            
+
         state_dict[key] = state_dict[key].astype(dtype) # type: ignore
-    
+
     safejax.save_file(state_dict, file) # type: ignore
+
+
+def nearest_divisor(scaled_num_heads, embed_dim):
+    # Find all divisors of embed_dim
+    divisors = [k for k in range(1, embed_dim + 1) if embed_dim % k == 0]
+
+    # Find the nearest divisor
+    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
+
+    return nearest
 
 
 def apply_mask(x: Array, mask, patch_size):
@@ -108,16 +118,23 @@ def random_mask(bs, height, width, patch_size, mask_ratio):
 
 
 def remove_masked_patches(patches: Array, mask: Array):
-    mask = jnp.logical_not(jnp.bool(mask))
-
+    # Convert and invert mask
+    mask = jnp.logical_not(mask)
     bs, num_patches, embed_dim = patches.shape
-    mask = jnp.expand_dims(mask, axis=-1)
-    mask = jnp.broadcast_to(mask, shape=(-1, -1, embed_dim))
-    mask_ids = jnp.nonzero(jnp.reshape(mask, (-1)))
-    unmasked_patches = jnp.reshape(patches, shape=-1)
-    unmasked_patches = jnp.take(unmasked_patches, mask_ids[0]).reshape(bs, -1, embed_dim)
 
-    return unmasked_patches
+    # Reshape mask to 2D (combining batch and patches)
+    mask_flat = mask.reshape(-1)
+    print(f"flat mask: {mask.shape}")
+
+    indices = jnp.nonzero(mask_flat, size=mask.shape[1])[0]
+    print(f"ids: {indices.shape}")
+
+    patches_flat = patches.reshape(-1, embed_dim)
+
+    unmasked_patches = jnp.take(patches_flat, indices, axis=0)
+    print(f"unmasked_patches: {unmasked_patches.shape}")
+
+    return unmasked_patches.reshape(bs, -1, embed_dim)
 
 
 def add_masked_patches(patches: Array, mask: Array):
