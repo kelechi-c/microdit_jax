@@ -3,7 +3,7 @@ from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
 from einops import rearrange
 from typing import Tuple
-from .data_utils import jnp_topk
+from .data_utils import jnp_topk, nearest_divisor
 
 # class config:
 embed_dim: int = 1024
@@ -128,7 +128,6 @@ class LabelEmbedder(nnx.Module):
         return label_embeds
 
 
-
 class CaptionEmbedder(nnx.Module):
     def __init__(self, cap_embed_dim, embed_dim):
         super().__init__()
@@ -171,8 +170,6 @@ class PoolMLP(nnx.Module):
         x = self.linear_2(x)
 
         return x
-
-
 
 
 #### MoE Gate
@@ -579,7 +576,76 @@ class DiTBackbone(nnx.Module):
         return cfg_out
 
 
-backbone = DiTBackbone()
+# backbone = DiTBackbone()
+
+
+class TransformerBackbone(nnx.Module):
+    def __init__(
+        self,
+        input_dim: int,
+        embed_dim: int,
+        class_embed_dim: int,
+        num_layers: int,
+        num_heads: int,
+        mlp_dim: int,
+        num_experts: int = 4,
+        active_experts: int = 2,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_embedding = nnx.Linear(input_dim, embed_dim, rngs=rngs)
+        self.class_embedding = nnx.Linear(class_embed_dim, embed_dim, rngs=rngs)
+
+        # Define scaling ranges for m_f and m_a
+        mf_min, mf_max = 0.5, 4.0
+        ma_min, ma_max = 0.5, 1.0
+
+        self.layers = []
+
+        for v in range(num_layers):
+            # Calculate scaling factors for the v-th layer using linear interpolation
+            mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
+            ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
+            print(f'mf {mf}, ma {ma}')
+
+            # Scale the dimensions according to the scaling factors
+            scaled_mlp_dim = int(mlp_dim * mf)
+            scaled_num_heads = max(1, int(num_heads * ma))
+            scaled_num_heads = nearest_divisor(scaled_num_heads, embed_dim)
+            mlp_ratio = int(scaled_mlp_dim / embed_dim)
+
+            # Choose layer type based on the layer index (even/odd)
+            if v % 2 == 0:  # Even layers use regular DiT blocks
+                self.layers.append(
+                    DiTBlock(
+                        embed_dim, scaled_num_heads, mlp_ratio, 1, 1, attn_drop=dropout
+                    )
+                )
+            else:  # Odd layers use MoE DiT block
+                self.layers.append(
+                    DiTBlock(
+                        embed_dim,
+                        scaled_num_heads,
+                        mlp_ratio,
+                        num_experts,
+                        active_experts,
+                        attn_drop=dropout,
+                    )
+                )
+
+        self.output_layer = nnx.Linear(embed_dim, input_dim, rngs=rngs)
+
+    def __call__(self, x, c_emb):
+        x = self.input_embedding(x)
+        
+        class_emb = self.class_embedding(c_emb)
+
+        for layer in self.layers:
+            x = layer(x, class_emb)
+
+        x = self.output_layer(x)
+        
+        return x
 
 
 # Adapted from https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
