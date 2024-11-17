@@ -1,4 +1,4 @@
-import jax, math, os, wandb, time, gc, optax, torchvision
+import jax, os, wandb, time, gc, optax, torchvision
 from flax import nnx
 from tqdm.auto import tqdm
 from functools import partial
@@ -6,6 +6,10 @@ from diffusers import AutoencoderKL
 from .data_utils import config, train_loader, random_mask, apply_mask
 from .microdit import MicroDiT 
 from .rf_sampler import RectFlow
+
+os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
+XLA_PYTHON_CLIENT_MEM_FRACTION = 0.50
 
 num_devices = jax.device_count()
 devices = jax.devices()
@@ -65,12 +69,12 @@ def train_step(model, optimizer, batch):
     return loss
 
 
-def sample_images(model, vae, noise, embeddings):
-    # Use the stored embeddings
-    sampled_latents = model.sample(noise, embeddings)
-    # Decode latents to images
-    sampled_images = vae.decode(sampled_latents).sample
-    return sampled_images
+# def sample_images(model, vae, noise, embeddings):
+#     # Use the stored embeddings
+#     sampled_latents = model.sample(noise, embeddings)
+#     # Decode latents to images
+#     sampled_images = vae.decode(sampled_latents).sample
+#     return sampled_images
 
 
 def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
@@ -83,16 +87,21 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
     #     project_name="transformer_playjax",
     #     run_name="tinygpt-1e-4-bs32-tpu",
     # )
-
+    stime = time.time()
+    
     for epoch in tqdm(range(epochs)):
+        step_count = len(train_loader)
+        
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss = train_step(model, optimizer, batch)
-            print(f"step {step}, loss-> {train_loss.item():.4f}")
-            
-            # wandb.log({"loss": train_loss.item()})
+            print(f"step {step}/{step_count}, loss-> {train_loss.item():.4f}")
 
+            # wandb.log({"loss": train_loss.item()})
         print(f"epoch {epoch+1}, train loss => {train_loss}")
+    
+    endtime = time.time() - stime 
+    print(f'trained {epochs} epochs in {endtime/60}mins (or {endtime}seconds)')
 
 
 trainer()
