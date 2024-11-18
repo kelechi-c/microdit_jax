@@ -5,13 +5,13 @@ from einops import rearrange
 from typing import Tuple
 from .data_utils import jnp_topk, nearest_divisor
 
-# class config:
-embed_dim: int = 1024
-img_size: int = 256
-patch_size: int = 4
 
 rkey = jrand.key(3)
 rngs = nnx.Rngs(3)
+
+xavier_init = nnx.initializers.xavier_uniform()
+zero_init = nnx.initializers.constant(0)
+linear_bias_init = nnx.initializers.constant(1)
 
 
 # input patchify layer, 2D image to patches
@@ -29,7 +29,6 @@ class PatchEmbed(nnx.Module):
         self.img_size = img_size
         self.gridsize = tuple([s // p for s, p in zip(img_size, patch_size)])
         self.num_patches = self.gridsize[0] * self.gridsize[1]
-        linear_init = nnx.initializers.constant(0)
 
         self.conv_project = nnx.Conv(
             in_chan, embed_dim, kernel_size=patch_size,
@@ -50,7 +49,7 @@ def modulate(x_array: Array, shift, scale) -> Array:
 
     return x
 
-# equivalnet of F.lineat
+# equivalnet of F.linear
 def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
     out = jnp.dot(array, weight)
 
@@ -104,13 +103,16 @@ class LabelEmbedder(nnx.Module):
     def __init__(self, num_classes, hidden_size, drop):
         super().__init__()
         use_cfg_embeddings = drop > 0
-        self.embedding_table = nnx.Embed(num_classes + use_cfg_embeddings, hidden_size, rngs=rngs)
+        self.embedding_table = nnx.Embed(
+            num_classes + use_cfg_embeddings, hidden_size,
+            rngs=rngs, embedding_init=nnx.initializers.normal(0.02)
+        )
         self.num_classes = num_classes
         self.dropout = drop
 
     def token_drop(self, labels, force_drop_ids=None) -> Array:
         if force_drop_ids is None:
-            drop_ids = jrand.normal(key=rkey, shape=labels.shape[0]).to_device(labels.device)
+            drop_ids = jrand.normal(key=randkey, shape=labels.shape[0])
         else:
             drop_ids = force_drop_ids == 1
 
@@ -189,14 +191,16 @@ class MoEGate(nnx.Module):
         self.gating_dim = embed_dim
         param_init = nnx.initializers.he_uniform()
         self.weight = nnx.Param(jnp.empty((self.routed_exoerts, self.gating_dim)))
-        # self.linear_gate = nnx.Linear()
+        # self.linear_gate = 
+        nnx.Variable()
 
     def __call__(self, hidden_states: Array) -> Tuple:
         bsize, seq_len, h = hidden_states.shape
         # gating score
         hidden_states = jnp.reshape(hidden_states, (-1, h))
-        logits = jnp.dot(hidden_states, self.weight["Array"])
+        logits = jnp.dot(hidden_states, self.weight)
         scores = nnx.softmax(logits, axis=-1)
+        nnx.Em
 
         topk_idx, topk_weight = jax.lax.top_k(scores, k=self.top_k)
 
@@ -204,6 +208,7 @@ class MoEGate(nnx.Module):
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
             topk_weight = topk_weight / denominator
+            
 
         # expert level computation of auxiliary loss
         # always compute topk based on naive greedy topk method
@@ -211,6 +216,7 @@ class MoEGate(nnx.Module):
             scores_for_aux = scores
             aux_topk = self.top_k
             aux_loss = 0.0
+            jnp.arr
 
             topk_idx_for_auxloss = jnp.reshape(topk_idx, (bsize, -1))
             if self.seq_aux:
@@ -340,11 +346,30 @@ class SelfAttention(nnx.Module):
         linear_init = nnx.initializers.xavier_uniform()
         linear_bias_init = nnx.initializers.constant(0)
 
-        self.q_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init, kernel_init=linear_init)
-        self.k_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.v_linear = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.q_linear = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+        )
+        self.k_linear = nnx.Linear(
+            embed_dim, embed_dim, rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init
+        )
+        self.v_linear = nnx.Linear(
+            embed_dim, embed_dim,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+            rngs=rngs
+        )
 
-        self.outproject = nnx.Linear(embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init)
+        self.outproject = nnx.Linear(
+            embed_dim, embed_dim, rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init
+        )
         self.dropout = nnx.Dropout(drop, rngs=rngs)
 
     def __call__(self, x_input: jax.Array) -> jax.Array:
@@ -382,14 +407,26 @@ class CrossAttention(nnx.Module):
             embed_dim,
             rngs=rngs,
             bias_init=linear_bias_init,
-            kernel_init=linear_init,
+            kernel_init=linear_init
         )
 
-        self.k_linear = nnx.Linear(cond_dim, embed_dim, rngs=rngs)
-        self.v_linear = nnx.Linear(cond_dim, embed_dim, rngs=rngs)
+        self.k_linear = nnx.Linear(
+            cond_dim, embed_dim,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+            rngs=rngs
+          )
+        self.v_linear = nnx.Linear(
+            cond_dim, embed_dim,
+            rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init
+        )
 
         self.outproject = nnx.Linear(
-            embed_dim, embed_dim, rngs=rngs, bias_init=linear_bias_init
+            embed_dim, embed_dim, rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init
         )
         self.dropout = nnx.Dropout(drop, rngs=rngs)
 
@@ -410,9 +447,9 @@ class CrossAttention(nnx.Module):
 
         output = rearrange(attn_output, "b h l d -> b l (h d)")
         output = self.dropout(self.outproject(output))
-        print(f"attn out shape => {output.shape}")
-        return output
 
+        # print(f"attn out shape => {output.shape}")
+        return output
 
 ###############
 # DiT blocks_ #
@@ -454,6 +491,7 @@ class DiTBlock(nnx.Module):
         attn_mod_x = self.attention(
             modulate(self.norm_1(x_input), shift_msa, scale_msa)
         )
+        
         x = x_input + jnp.expand_dims(gate_msa, 1) * attn_mod_x
 
         mlp_mod_x = self.moe_block(modulate(self.norm_2(x), shift_mlp, scale_mlp))
