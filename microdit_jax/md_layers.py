@@ -173,15 +173,14 @@ class PoolMLP(nnx.Module):
 
         return x
 
-
 #### MoE Gate
 class MoEGate(nnx.Module):
     def __init__(
-        self, embed_dim, num_experts=8, experts_per_token=2, aux_loss_alpha=0.01
+        self, embed_dim, num_experts=4, experts_per_token=2, aux_loss_alpha=0.01
     ):
         super().__init__()
         self.top_k = experts_per_token
-        self.routed_exoerts = num_experts
+        self.routed_experts = num_experts
         self.score_func = "softmax"
         self.alpha = aux_loss_alpha
         self.seq_aux = False
@@ -189,44 +188,47 @@ class MoEGate(nnx.Module):
         # top_k selection algo
         self.norm_topk_prob = False
         self.gating_dim = embed_dim
-        param_init = nnx.initializers.he_uniform()
-        self.weight = nnx.Param(jnp.empty((self.routed_exoerts, self.gating_dim)))
-        # self.linear_gate = 
-        nnx.Variable()
+        self.weight = nnx.Param(jnp.ones((4, embed_dim)))
+        print(self.weight.shape)
+        # self.linear_gate = nnx.Linear()
 
     def __call__(self, hidden_states: Array) -> Tuple:
         bsize, seq_len, h = hidden_states.shape
+        
         # gating score
+        print(f'hidden 1 : {hidden_states.shape}')
         hidden_states = jnp.reshape(hidden_states, (-1, h))
-        logits = jnp.dot(hidden_states, self.weight)
+        print(f'hiddenstate: {hidden_states.shape}')
+        logits = jnp.dot(hidden_states, self.weight.T)
+        print(f'logits hiddenstate: {logits.shape}')
         scores = nnx.softmax(logits, axis=-1)
-        nnx.Em
+        print(f'scores {scores.shape}')
 
         topk_idx, topk_weight = jax.lax.top_k(scores, k=self.top_k)
+        print(f'topk_weight {topk_weight.shape}')
 
         # normalize to sum to 1
         if self.top_k > 1 and self.norm_topk_prob:
             denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
             topk_weight = topk_weight / denominator
-            
 
         # expert level computation of auxiliary loss
         # always compute topk based on naive greedy topk method
+
         if self.train and self.alpha > 0.0:
             scores_for_aux = scores
             aux_topk = self.top_k
             aux_loss = 0.0
-            jnp.arr
 
             topk_idx_for_auxloss = jnp.reshape(topk_idx, (bsize, -1))
             if self.seq_aux:
                 scores_for_seq_aux = jnp.reshape(scores_for_aux, (bsize, seq_len, -1))
                 ce = jnp.zeros(
-                    (bsize, self.routed_exoerts), device=hidden_states.device
+                    (bsize, self.routed_experts), device=hidden_states.device
                 )
                 ones_add = jnp.ones((bsize, seq_len * aux_topk))
                 ce = jnp.add.at(ce, 1, ones_add)
-                ce /= seq_len * aux_topk / self.routed_exoerts
+                ce /= seq_len * aux_topk / self.routed_experts
 
                 aux_loss = (ce * scores_for_seq_aux.mean(axis=1)).sum(
                     axis=1
@@ -235,19 +237,21 @@ class MoEGate(nnx.Module):
             else:
                 mask_ce = nnx.one_hot(
                     jnp.reshape(topk_idx_for_auxloss, (-1)),
-                    num_classes=self.routed_exoerts,
+                    num_classes=self.routed_experts,
                 )
                 ce = mask_ce.astype(jnp.float32).mean(0)
                 pi = scores_for_aux.mean()
-                fi = ce * self.routed_exoerts
+                fi = ce * self.routed_experts
                 aux_loss = (pi * fi).sum() * self.alpha
 
         else:
             aux_loss = None
 
         print(f"gate shape => {topk_weight.shape}")
+        # print(topk_weight)
 
         return topk_idx, topk_weight, aux_loss
+    
 
 # mixture of experts MLP layer
 class MoEMLP(nnx.Module):
