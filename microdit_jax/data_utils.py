@@ -1,5 +1,5 @@
 from jax import Array, numpy as jnp, random as jrand
-import flax, cv2, jax
+import flax, cv2, jax, pickle
 import numpy as np
 from flax import nnx
 from datasets import load_dataset
@@ -7,7 +7,7 @@ from torch.utils.data import DataLoader, IterableDataset
 from collections import namedtuple
 import flax.traverse_util
 from flax.serialization import to_state_dict
-import safetensors.flax as safejax
+from flax.core import freeze
 from PIL import Image as pillow
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from transformers import AutoTokenizer, T5EncoderModel
@@ -46,30 +46,31 @@ def jnp_topk(array: Array, k: int):
 
     sort_idx = sort_indices[argsort]
     values = flat[sort_idx]
-    
+
     idx = jnp.unravel_index(sort_idx, array.shape)
-    
+
     if len(idx) == 1:
         idx, = idx
-    
+
     return topk_tuple(values=values, ids=idx)
 
 
-# save model params in safetensors file
-def save_model(model: nnx.Module, file: str, dtype):
-    _, state = nnx.split(model)
-    params = state.filter(nnx.Param)
+# save model params in pickle file
+def save_paramdict_pickle(model, filename="/tmp/model.pkl"):
+    params = nnx.state(model)
+
+    # params = state.filter(nnx.Param)
+    params = jax.device_get(params)
+
     state_dict = to_state_dict(params)
+    frozen_state_dict = freeze(state_dict)
 
-    state_dict = flax.traverse_util.flatten_dict(state_dict, sep='.')
+    flat_state_dict = flax.traverse_util.flatten_dict(frozen_state_dict, sep=".")
 
-    for key in list(state_dict.keys()):
-        if not isinstance(state_dict[key], Array):
-            state_dict[key] = jnp.array(state_dict[key]) # type: ignore
+    with open(filename, "wb") as f:
+        pickle.dump(frozen_state_dict, f)
 
-        state_dict[key] = state_dict[key].astype(dtype) # type: ignore
-
-    safejax.save_file(state_dict, file) # type: ignore
+    return flat_state_dict
 
 
 def nearest_divisor(scaled_num_heads, embed_dim):
