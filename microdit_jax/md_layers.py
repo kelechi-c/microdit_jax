@@ -1,19 +1,20 @@
 import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
-from einops import rearrange
 from typing import Tuple
-from .data_utils import jnp_topk, nearest_divisor
-
+from .data_utils import nearest_divisor
+from .attention import SelfAttention, CrossAttention, SimpleMLP
 
 rkey = jrand.key(3)
 rngs = nnx.Rngs(3)
+randkey = jrand.key(3)
 
+# init values
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 linear_bias_init = nnx.initializers.constant(1)
 
-
+## Embedding layers
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
     def __init__(
@@ -143,35 +144,6 @@ class CaptionEmbedder(nnx.Module):
         return x
 
 
-class SimpleMLP(nnx.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-
-    def __call__(self, x: Array) -> Array:
-        x = nnx.silu(self.linear_1(x))
-        x = self.linear_2(x)
-
-        return x
-
-
-class PoolMLP(nnx.Module):
-    def __init__(self, embed_dim):
-        super().__init__()
-        self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-
-    def __call__(self, x: Array) -> Array:
-        x = nnx.avg_pool(x, (1,))
-        print(f'avg pool; {x.shape}')
-        x = jnp.reshape(x, shape=(x.shape[0], -1))
-        print(f'avg pool rsd {x.shape}')
-
-        x = nnx.gelu(self.linear_1(x))
-        x = self.linear_2(x)
-
-        return x
 
 #### MoE Gate
 class MoEGate(nnx.Module):
@@ -380,167 +352,76 @@ class SparseMoEBlock(nnx.Module):
         pass
 
 
-# self attention block
-class SelfAttention(nnx.Module):
-    def __init__(self, attn_heads, embed_dim, rngs: nnx.Rngs, drop=0.1):
-        super().__init__()
-        self.attn_heads = attn_heads
-        self.head_dim = embed_dim // attn_heads
-
-        linear_init = nnx.initializers.xavier_uniform()
-        linear_bias_init = nnx.initializers.constant(0)
-
-        self.q_linear = nnx.Linear(
-            embed_dim,
-            embed_dim,
-            rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init,
-        )
-        self.k_linear = nnx.Linear(
-            embed_dim, embed_dim, rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init
-        )
-        self.v_linear = nnx.Linear(
-            embed_dim, embed_dim,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init,
-            rngs=rngs
-        )
-
-        self.outproject = nnx.Linear(
-            embed_dim, embed_dim, rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init
-        )
-        self.dropout = nnx.Dropout(drop, rngs=rngs)
-
-    def __call__(self, x_input: jax.Array) -> jax.Array:
-        q = self.q_linear(x_input)
-        k = self.k_linear(x_input)
-        v = self.v_linear(x_input)
-
-        q, k, v = map(
-            lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
-        )
-
-        qk = q @ jnp.matrix_transpose(k)
-        attn_logits = qk / math.sqrt(self.head_dim)  # attention computation
-
-        attn_score = nnx.softmax(attn_logits, axis=-1)
-        attn_output = attn_score @ v
-
-        output = rearrange(attn_output, "b h l d -> b l (h d)")
-        output = self.dropout(self.outproject(output))
-        print(f"attn out shape => {output.shape}")
-        return output
-
-
-class CrossAttention(nnx.Module):
-    def __init__(self, attn_heads, embed_dim, cond_dim, rngs: nnx.Rngs, drop=0.1):
-        super().__init__()
-        self.attn_heads = attn_heads
-        self.head_dim = embed_dim // attn_heads
-
-        linear_init = nnx.initializers.xavier_uniform()
-        linear_bias_init = nnx.initializers.constant(0)
-
-        self.q_linear = nnx.Linear(
-            embed_dim,
-            embed_dim,
-            rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init
-        )
-
-        self.k_linear = nnx.Linear(
-            cond_dim, embed_dim,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init,
-            rngs=rngs
-          )
-        self.v_linear = nnx.Linear(
-            cond_dim, embed_dim,
-            rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init
-        )
-
-        self.outproject = nnx.Linear(
-            embed_dim, embed_dim, rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init
-        )
-        self.dropout = nnx.Dropout(drop, rngs=rngs)
-
-    def __call__(self, x_input: jax.Array, y_cond: Array) -> jax.Array:
-        q = self.q_linear(x_input)
-        k = self.k_linear(y_cond)
-        v = self.v_linear(y_cond)
-
-        q, k, v = map(
-            lambda x: rearrange(x, "b l (h d) -> b h l d", h=self.attn_heads), (q, k, v)
-        )
-
-        qk = q @ jnp.matrix_transpose(k)
-        attn_logits = qk / math.sqrt(self.head_dim)  # attention computation
-
-        attn_score = nnx.softmax(attn_logits, axis=-1)
-        attn_output = attn_score @ v
-
-        output = rearrange(attn_output, "b h l d -> b l (h d)")
-        output = self.dropout(self.outproject(output))
-
-        # print(f"attn out shape => {output.shape}")
-        return output
 
 ###############
 # DiT blocks_ #
 ###############
-
-
 class DiTBlock(nnx.Module):
-    def __init__(self, hidden_size=1024, num_heads=6):
+    def __init__(self, hidden_size=1024, num_heads=6, num_experts=4, mlp_ratio=4, experts_pertok=2):
         super().__init__()
 
         # initializations
         linear_init = nnx.initializers.xavier_uniform()
-        lnbias_init = nnx.initializers.constant(0)
-        lnweight_init = nnx.initializers.constant(0)
+        lnbias_init = nnx.initializers.constant(1)
+        lnweight_init = nnx.initializers.constant(1)
 
         self.norm_1 = nnx.LayerNorm(
             hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
         )
         self.attention = SelfAttention(num_heads, hidden_size, rngs=rngs)
-        self.norm_2 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.norm_2 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs, scale_init=lnweight_init)
 
         self.adaln_linear = nnx.Linear(
             in_features=hidden_size,
-            out_features=hidden_size,
+            out_features= 6 * hidden_size,
             use_bias=True,
-            # bias_init=linear_init,
             rngs=rngs,
-            # kernel_init=lnweight_init,
+            # adaLN-zero init
+            bias_init=zero_init, 
+            kernel_init=zero_init
         )
-        self.moe_block = SparseMoEBlock(hidden_size)
-        print("dit block online")
 
-    def __call__(self, x_img: Array):
-        x_input = self.adaln_linear(nnx.silu(x_img))
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            jnp.array_split(x_input, 6)
+        self.moe_block = SparseMoEBlock(
+            hidden_size,
+            mlp_ratio=mlp_ratio,
+            num_experts=num_experts,
+            experts_per_token=experts_pertok
         )
+        self.mlp_layer = SimpleMLP(hidden_size)
+
+    def __call__(self, x_img: Array, cond):
+        print(f'ximg {x_img.shape}')
+
+        # print('cond before adaln')
+        cond = self.adaln_linear(nnx.silu(cond))
+
+        print(f'dit cond {cond.shape}')
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            jnp.array_split(cond, 6, axis=1)
+        )
+
+        print(f'shift and scale {shift_msa.shape}')
 
         attn_mod_x = self.attention(
-            modulate(self.norm_1(x_input), shift_msa, scale_msa)
+            modulate(self.norm_1(x_img), shift_msa, scale_msa)
         )
-        
-        x = x_input + jnp.expand_dims(gate_msa, 1) * attn_mod_x
 
-        mlp_mod_x = self.moe_block(modulate(self.norm_2(x), shift_mlp, scale_mlp))
+        print(f'mod attn {attn_mod_x.shape}')
+
+        x = x_img + jnp.expand_dims(gate_msa, 1) * attn_mod_x
+        print(f'rescon 1: {x.shape}')
+        x = modulate(self.norm_2(x), shift_mlp, scale_mlp)
+        print(f'mod x2 {x.shape}, {type(x)}')
+
+        # mlp_mod_x = self.moe_block(x) # using MoE 
+        
+        mlp_mod_x = self.mlp_layer(x) # using simple MLP layer 
+        print(f'dit mlp x {mlp_mod_x.shape}')
+
         x = x + jnp.expand_dims(gate_mlp, 1) * mlp_mod_x
-        print(f"x dit block {type(x)} {x.shape}")
+        print(f'dit block {type(x)} {x.shape}')
+
         return x
 
 
