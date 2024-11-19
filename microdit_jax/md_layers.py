@@ -252,14 +252,17 @@ class MoEGate(nnx.Module):
 
         return topk_idx, topk_weight, aux_loss
     
-
 # mixture of experts MLP layer
 class MoEMLP(nnx.Module):
     def __init__(self, hidden_size, intersize, pretrain_tp=2):
         self.hidden_size = hidden_size
         self.intersize = intersize
         self.pretrain_tp = pretrain_tp
-        self.gate_project = nnx.Linear(self.hidden_size, self.intersize, use_bias=False, rngs=rngs)
+        self.gate_project = nnx.Linear(
+            self.hidden_size, self.intersize,
+            use_bias=False, rngs=rngs,
+            kernel_init=nnx.initializers.xavier_uniform()
+        )
         self.up_project = nnx.Linear(
             self.hidden_size, self.intersize, use_bias=False, rngs=rngs
         )
@@ -268,27 +271,64 @@ class MoEMLP(nnx.Module):
         )
 
     def __call__(self, x_input: Array):
-        down_proj = None
-        
-        if self.pretrain_tp > 1:
-            w_slice = self.intersize // self.pretrain_tp
-            gate_slices = jnp.split(self.gate_project.kernel[1:], w_slice, axis=0)
-            up_slices = jnp.split(self.up_project.kernel[1:], w_slice, axis=0)
-            down_slices = jnp.split(self.down_project.kernel[1:], w_slice, axis=1)
+        batch_size, seq_len, _ = x_input.shape
 
-            gate_proj = jnp.concat([linear(x_input, gate_slices[k]) for k in range(self.pretrain_tp)], axis=-1)
-            up_proj = jnp.concat(
-                [linear(x_input, up_slices[k]) for k in range(self.pretrain_tp)],
-                axis=-1,
-            )
-            inter_states = jnp.split((nnx.silu(gate_proj) * up_proj), w_slice, axis=-1)
-            down_proj = [linear(inter_states[k], down_slices[k]) for k in range(self.pretrain_tp)]
-            down_proj = sum(down_proj)
-        
+        if self.pretrain_tp > 1:
+            # Calculate slice width
+            w_slice = self.intersize // self.pretrain_tp
+
+            # Split weights into expert chunks
+            gate_slices = jnp.split(self.gate_project.kernel, self.pretrain_tp, axis=0)
+            up_slices = jnp.split(self.up_project.kernel, self.pretrain_tp, axis=0)
+            down_slices = jnp.split(self.down_project.kernel, self.pretrain_tp, axis=1)
+
+            # Compute projections for each expert
+            gate_projs = []
+            up_projs = []
+
+            for k in range(self.pretrain_tp):
+                # Reshape input for batch matrix multiplication
+                x_reshaped = x_input.reshape(-1, self.hidden_size)
+
+                # Compute gate and up projections
+                gate_proj_k = jnp.dot(x_reshaped, gate_slices[k].T)
+                up_proj_k = jnp.dot(x_reshaped, up_slices[k].T)
+
+                gate_projs.append(gate_proj_k)
+                up_projs.append(up_proj_k)
+
+            # Concatenate expert outputs
+            gate_proj = jnp.concatenate(gate_projs, axis=-1)
+            up_proj = jnp.concatenate(up_projs, axis=-1)
+
+            # Reshape back to (batch_size, seq_len, intersize)
+            gate_proj = gate_proj.reshape(batch_size, seq_len, -1)
+            up_proj = up_proj.reshape(batch_size, seq_len, -1)
+
+            # Compute intermediate states
+            activated_gates = nnx.silu(gate_proj)  # Changed from silu to sigmoid for gating
+            inter_states = jnp.split(activated_gates * up_proj, self.pretrain_tp, axis=-1)
+
+            # Compute final projection
+            down_projs = []
+            for k in range(self.pretrain_tp):
+                down_proj_k = jnp.dot(
+                    inter_states[k].reshape(-1, w_slice),
+                    down_slices[k]
+                )
+                down_projs.append(down_proj_k)
+
+            # Sum expert outputs and reshape
+            down_proj = sum(down_projs)
+            down_proj = down_proj.reshape(batch_size, seq_len, self.hidden_size)
+
         else:
-            activated_x = nnx.silu(self.gate_project(x_input)) * self.up_project(x_input)
-            down_proj = self.down_project(activated_x)
-        
+            # Standard MLP path
+            gate_output = jnp.sigmoid(self.gate_project(x_input))  # Changed from silu to sigmoid
+            up_output = self.up_project(x_input)
+            down_proj = self.down_project(gate_output * up_output)
+
+        print(f"moe mlp shape => {down_proj.shape}")
         return down_proj
 
 
