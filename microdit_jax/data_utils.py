@@ -3,6 +3,7 @@ import flax, cv2, jax, pickle
 import numpy as np
 from flax import nnx
 from datasets import load_dataset
+from einops import rearrange
 from torch.utils.data import DataLoader, IterableDataset
 from collections import namedtuple
 import flax.traverse_util
@@ -154,7 +155,6 @@ def add_masked_patches(patches: Array, mask: Array):
 
     return full_patches
 
-## nov_14_0453
 
 # T5 text encoder
 t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)

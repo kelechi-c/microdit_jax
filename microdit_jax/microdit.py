@@ -41,8 +41,6 @@ class MicroDiT(nnx.Module):
         attn_heads,
         mlp_dim,
         cond_embed_dim,
-        num_experts=4,
-        active_experts=2,
         dropout=0.1,
         patchmix_layers=2,
         rngs=rngs,
@@ -94,7 +92,7 @@ class MicroDiT(nnx.Module):
         p = self.patch_embedder.patch_size[0]
         h = w = int(x.shape[1] ** 0.5)
         assert h * w == x.shape[1]
-
+        jnp.t
         x = jnp.reshape(x, shape=(x.shape[0], h, w, p, p, c))
         x = jnp.einsum("nhwpqc->nchpwq", x)
         img = jnp.reshape(x, shape=(x.shape[0], c, h * p, w * p))

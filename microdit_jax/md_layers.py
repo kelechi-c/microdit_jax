@@ -28,13 +28,12 @@ class PatchEmbed(nnx.Module):
         super().__init__()
         self.patch_size = (patch_size, patch_size)
         self.img_size = img_size
-        self.gridsize = tuple([s // p for s, p in zip(img_size, patch_size)])
-        self.num_patches = self.gridsize[0] * self.gridsize[1]
 
         self.conv_project = nnx.Conv(
             in_chan, embed_dim, kernel_size=patch_size,
            strides=patch_size, rngs=rngs,
         )
+        
 
     def __call__(self, img: Array) -> Array:
         x = self.conv_project(img)
