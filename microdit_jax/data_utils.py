@@ -6,8 +6,8 @@ from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from collections import namedtuple
 import flax.traverse_util
-from flax.serialization import to_state_dict
-from flax.core import freeze
+from flax.serialization import to_state_dict, from_state_dict
+from flax.core import freeze, unfreeze
 from PIL import Image as pillow
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from transformers import AutoTokenizer, T5EncoderModel
@@ -61,7 +61,7 @@ def jnp_topk(array: Array, k: int):
 
 
 # save model params in pickle file
-def save_paramdict_pickle(model, filename="/tmp/model.pkl"):
+def save_paramdict_pickle(model, filename="model.pkl"):
     params = nnx.state(model)
     params = jax.device_get(params)
 
@@ -74,6 +74,19 @@ def save_paramdict_pickle(model, filename="/tmp/model.pkl"):
         pickle.dump(frozen_state_dict, f)
 
     return flat_state_dict
+
+
+def load_paramdict_pickle(model, filename="model.pkl"):
+    with open(filename, "rb") as modelfile:
+        params = pickle.load(modelfile)
+
+    params = flax.traverse_util.unflatten_dict(params, sep=".")
+    params = unfreeze(params)
+    params = from_state_dict(params)
+    
+    nnx.update(model, params)
+
+    return params
 
 
 def apply_mask(x: Array, mask, patch_size):
@@ -149,6 +162,29 @@ def add_masked_patches(patches: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     full_patches = full_patches.at[mask].set(patches.reshape(-1, embed_dim))
 
     return full_patches
+
+
+def display_samples(sample_batch):
+    batch = np.array(sample_batch[-1])
+    # Set up the grid
+    batch_size = batch.shape[0]
+
+    grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
+
+    fig, axes = plt.subplots(grid_size, grid_size, figsize=(10, 10))
+
+    # Plot each image
+    for i, ax in enumerate(axes.flat):
+        if i < batch_size:
+            img = (batch[i] * 255).astype(np.uint8)
+            ax.imshow(img)
+            ax.axis("off")
+        else:
+            ax.axis("off")  # Hide unused subplots
+
+    plt.tight_layout()
+    plt.show()
+
 
 # image grid
 def save_image_grid(batch, file_path: str, grid_size=None):

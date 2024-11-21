@@ -1,15 +1,17 @@
-import jax, os, wandb, time, gc, optax
+import jax, os, wandb, time, gc, optax, click
 from flax import nnx
+from jax import random as jrand
 from tqdm.auto import tqdm
 from functools import partial
 from diffusers import AutoencoderKL
-from .data_utils import config, train_loader, random_mask, save_image_grid
+from .data_utils import config, train_loader, random_mask, save_image_grid, save_paramdict_pickle
 from .microdit import MicroDiT 
 from .rf_sampler import RectFlowWrapper
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 XLA_PYTHON_CLIENT_MEM_FRACTION = 0.50
+randkey = jrand.key(config.seed)
 
 num_devices = jax.device_count()
 devices = jax.devices()
@@ -51,22 +53,8 @@ def sample_image_batch(step):
         'image': wandb.Image(data_or_path=gridfile)
     ) 
 
-def loss_func(model, batch):
-    img_latents, label = batch
-    bs, height, width, channels = img_latents.shape
-    print(img_latents.shape)
 
-    img_latents = img_latents * config.vaescale_factor
-    mask = random_mask(
-        bs, height, width, patch_size=config.patch_size, mask_ratio=config.mask_ratio
-    )
-    print(f"mask shape {mask.shape}")
-    loss = model(img_latents, label, mask)
-    # loss = optax.squared_error(img_latents, logits).mean()
-
-    return loss
-
-# @nnx.jit
+@nnx.jit
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
       img_latents, label = batch
@@ -81,7 +69,6 @@ def train_step(model, optimizer, batch):
     gradfn = nnx.value_and_grad(loss_func)
     loss, grads = gradfn(model, batch)
     optimizer.update(grads)
-    # print(f'Loss => {loss}')
     return loss
 
 
@@ -92,27 +79,34 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
     # wandb_logger(
     #     key=None,
     #     model=model,
-    #     project_name="microdit_jax-cifar",
-    #     run_name="microdit-cifar1",
+    #     project_name="microdit_jax-",
+    #     run_name="microdit-",
     # )
+    stime = time.time()
 
     for epoch in tqdm(range(epochs)):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss = train_step(model, optimizer, batch)
             print(f"step {step}, loss-> {train_loss.item():.4f}")
+            # wandb.log({"loss": train_loss.item()})
 
             if step % 1000 == 0:
                 gridfile = sample_image_batch(step)
-                image_log = wandb
-                wandb.log({'image_sample': image_log})
+                image_log = wandb.Image(gridfile)
+                # wandb.log({'image_sample': image_log})
                 
-            # wandb.log({"loss": train_loss.item()})
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
         save_paramdict_pickle(model, f'microdit_cifar_{epoch}_{train_loss}.pkl')
+    
+    etime = time.time() - stime
+    print(f'training time for {epochs} epochs -> {etime}s / {etime/60} mins')
+    
+    return model
 
 
-trainer()
-# wandb.finish()
-print("microdit test training in JAX")
+if __name__=='main':
+    trainer()
+    # wandb.finish()
+    print("microdit test training in JAX")
