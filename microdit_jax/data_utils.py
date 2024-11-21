@@ -3,7 +3,6 @@ import flax, cv2, jax, pickle
 import numpy as np
 from flax import nnx
 from datasets import load_dataset
-from einops import rearrange
 from torch.utils.data import DataLoader, IterableDataset
 from collections import namedtuple
 import flax.traverse_util
@@ -13,13 +12,15 @@ from PIL import Image as pillow
 from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from transformers import AutoTokenizer, T5EncoderModel
 from urllib.request import urlopen
+import matplotlib.pyplot as plt
+import numpy as np
 
-randkey = jrand.key(3)
 
 class config:
     vaescale_factor = 0.13025
     batch_size = 128
     img_size = 256
+    seed = 33
     patch_size = (4, 4)
     lr = 1e-4
     mask_ratio = 0.75
@@ -33,7 +34,10 @@ class config:
     vae_id = "madebyollin/sdxl-vae-fp16-fix"
     t5_id = "google-t5/t5-small"
     mini_data_id = 'uoft-cs/cifar10'
+    imagenet_id = 'ISLRVC/imagenet'
     device_0 = jax.default_device()
+
+randkey = jrand.key(config.seed)
 
 
 # jax/numpy implementation of topk selection
@@ -59,8 +63,6 @@ def jnp_topk(array: Array, k: int):
 # save model params in pickle file
 def save_paramdict_pickle(model, filename="/tmp/model.pkl"):
     params = nnx.state(model)
-
-    # params = state.filter(nnx.Param)
     params = jax.device_get(params)
 
     state_dict = to_state_dict(params)
@@ -72,16 +74,6 @@ def save_paramdict_pickle(model, filename="/tmp/model.pkl"):
         pickle.dump(frozen_state_dict, f)
 
     return flat_state_dict
-
-
-def nearest_divisor(scaled_num_heads, embed_dim):
-    # Find all divisors of embed_dim
-    divisors = [k for k in range(1, embed_dim + 1) if embed_dim % k == 0]
-
-    # Find the nearest divisor
-    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-
-    return nearest
 
 
 def apply_mask(x: Array, mask, patch_size):
@@ -119,55 +111,89 @@ def random_mask(bs, height, width, patch_size, mask_ratio):
     return mask
 
 
+def nearest_divisor(scaled_num_heads, embed_dim):
+    # Find all divisors of embed_dim
+    divisors = [k for k in range(1, embed_dim + 1) if embed_dim % k == 0]
+
+    # Find the nearest divisor
+    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
+
+    return nearest
+
+
 def remove_masked_patches(patches: Array, mask: Array):
     # Convert and invert mask
     mask = jnp.logical_not(mask)
     bs, num_patches, embed_dim = patches.shape
 
+    # Method 1: Using take with nonzero
     # Reshape mask to 2D (combining batch and patches)
     mask_flat = mask.reshape(-1)
-    print(f"flat mask: {mask.shape}")
-
     indices = jnp.nonzero(mask_flat, size=mask.shape[1])[0]
-    print(f"ids: {indices.shape}")
 
     patches_flat = patches.reshape(-1, embed_dim)
 
     unmasked_patches = jnp.take(patches_flat, indices, axis=0)
-    print(f"unmasked_patches: {unmasked_patches.shape}")
 
     return unmasked_patches.reshape(bs, -1, embed_dim)
 
 
-def add_masked_patches(patches: Array, mask: Array):
+def add_masked_patches(patches: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     # Ensure mask is a boolean tensor
-    mask = jnp.bool(mask)
+    mask = mask.astype(jnp.bool_)
 
     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
 
-    # Create a tensor of zeros with the same shape and dtype as the patches tensor
-    full_patches = jnp.zeros(shape=(bs, num_patches, embed_dim))
+    full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
 
-    # Iterate over each batch and place unmasked patches back in their original positions
-    for b in range(bs):
-        # Use the mask to place unmasked patches back in the correct positions
-        full_patches[b, mask[b]] = patches[b].astype(full_patches.dtype)
+    full_patches = full_patches.at[mask].set(patches.reshape(-1, embed_dim))
 
     return full_patches
 
+# image grid
+def save_image_grid(batch, file_path: str, grid_size=None):
+    batch = np.array(batch[-1])
+    # Determine grid size
+    batch_size = batch.shape[0]
+    if grid_size is None:
+        grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
+        rows, cols = grid_size, grid_size
+    else:
+        rows, cols = grid_size
 
-# T5 text encoder
-t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)
-t5_model = T5EncoderModel.from_pretrained(config.t5_id)
-vae = AutoencoderKL.from_pretrained(config.vae_id).to(config.device_0)
+    # Set up the grid
+    fig, axes = plt.subplots(rows, cols, figsize=(cols * 2, rows * 2))
 
-def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
-    input_ids = tokenizer(text_input, return_tensors='np').input_ids  # Batch size 1
-    outputs = model(input_ids=input_ids)
-    last_hidden_states = outputs.last_hidden_state
+    # Plot each image
+    for i, ax in enumerate(axes.flat):
+        if i < batch_size:
+            img = (batch[i] * 255).astype(np.uint8)  # Scale image to 0-255
+            ax.imshow(img)
+            ax.axis("off")
+        else:
+            ax.axis("off")  # Hide unused subplots
 
-    return last_hidden_states
+    plt.tight_layout()
+    plt.savefig(file_path, bbox_inches='tight')
+    plt.close(fig)
 
+    return file_path
+
+
+# T5 text encoder / VAE
+# t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)
+# t5_model = T5EncoderModel.from_pretrained(config.t5_id)
+# vae = AutoencoderKL.from_pretrained(config.vae_id).to(config.device_0)
+
+# def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
+#     input_ids = tokenizer(text_input, return_tensors='np').input_ids  # Batch size 1
+#     outputs = model(input_ids=input_ids)
+#     last_hidden_states = outputs.last_hidden_state
+
+#     return last_hidden_states
+
+
+###########################################################
 ## data loading
 image_data = load_dataset(config.mini_data_id, streaming=True, split='train', trust_remote_code=True).take(config.split)
 
