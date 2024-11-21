@@ -1,9 +1,13 @@
 import jax, math
-from jax import Array, numpy as jnp, random as jrand
+from jax import Array, numpy as jnp
 from flax import nnx
 from einops import rearrange
+from .data_utils import config
+from .md_layers import modulate
 
-rngs = nnx.Rngs(3)
+rngs = nnx.Rngs(config.seed)
+linear_init = nnx.initializers.xavier_uniform()
+linear_bias_init = nnx.initializers.constant(0)
 
 
 class SimpleMLP(nnx.Module):
@@ -19,20 +23,62 @@ class SimpleMLP(nnx.Module):
         return x
 
 
+# Pool + MLP for (MHA + MLP)
 class PoolMLP(nnx.Module):
     def __init__(self, embed_dim):
         super().__init__()
-        self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.linear_1 = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+        )
+        self.linear_2 = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            bias_init=linear_bias_init,
+            kernel_init=linear_init,
+        )
 
     def __call__(self, x: Array) -> Array:
         x = nnx.avg_pool(x, (1,))
-        print(f"avg pool; {x.shape}")
         x = jnp.reshape(x, shape=(x.shape[0], -1))
-        print(f"avg pool rsd {x.shape}")
-
         x = nnx.gelu(self.linear_1(x))
         x = self.linear_2(x)
+
+        return x
+
+
+class FinalMLP(nnx.Module):
+    def __init__(self, hidden_size, patch_size, out_channels):
+        super().__init__()
+        linear_init = nnx.initializers.xavier_uniform()
+        bias_init = nnx.initializers.constant(0)
+
+        self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.linear = nnx.Linear(
+            hidden_size,
+            patch_size * patch_size * out_channels,
+            rngs=rngs,
+            kernel_init=linear_init,
+            bias_init=bias_init,
+        )
+        self.adaln_linear = nnx.Linear(
+            hidden_size,
+            2 * hidden_size,
+            rngs=rngs,
+            kernel_init=nnx.initializers.xavier_uniform(),
+            bias_init=linear_init,
+        )
+
+    def __call__(self, x_input: Array, cond: Array):
+        linear_cond = nnx.silu(self.adaln_linear(cond))
+        shift, scale = jnp.array_split(linear_cond, 2, axis=1)
+
+        x = modulate(self.norm_final(x_input), shift, scale)
+        x = self.linear(x)
 
         return x
 
@@ -44,7 +90,6 @@ class SelfAttention(nnx.Module):
         self.attn_heads = attn_heads
         self.head_dim = embed_dim // attn_heads
 
-        linear_init = nnx.initializers.xavier_uniform()
         linear_bias_init = nnx.initializers.constant(0)
 
         self.q_linear = nnx.Linear(
@@ -104,9 +149,6 @@ class CrossAttention(nnx.Module):
         super().__init__()
         self.attn_heads = attn_heads
         self.head_dim = embed_dim // attn_heads
-
-        linear_init = nnx.initializers.xavier_uniform()
-        linear_bias_init = nnx.initializers.constant(0)
 
         self.q_linear = nnx.Linear(
             embed_dim,
