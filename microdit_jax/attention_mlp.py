@@ -10,14 +10,17 @@ linear_init = nnx.initializers.xavier_uniform()
 linear_bias_init = nnx.initializers.constant(0)
 
 
-class SimpleMLP(nnx.Module):
-    def __init__(self, embed_dim):
+class OutputMLP(nnx.Module):
+    def __init__(self, embed_dim, patch_size, out_channels):
         super().__init__()
         self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.linear_2 = nnx.Linear(
+            embed_dim, patch_size[0] * patch_size[1] * out_channels,
+            rngs=rngs
+        )
 
     def __call__(self, x: Array) -> Array:
-        x = nnx.silu(self.linear_1(x))
+        x = nnx.gelu(self.linear_1(x))
         x = self.linear_2(x)
 
         return x
