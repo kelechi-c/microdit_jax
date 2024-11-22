@@ -1,5 +1,5 @@
 from jax import Array, numpy as jnp, random as jrand
-import flax, cv2, jax, pickle
+import flax, cv2, jax, pickle, os
 import numpy as np
 from flax import nnx
 from datasets import load_dataset
@@ -14,6 +14,9 @@ from transformers import AutoTokenizer, T5EncoderModel
 from urllib.request import urlopen
 import matplotlib.pyplot as plt
 import numpy as np
+import subprocess, torch
+from typing import Optional, Union, List
+from pathlib import Path
 
 
 class config:
@@ -34,7 +37,7 @@ class config:
     vae_id = "madebyollin/sdxl-vae-fp16-fix"
     t5_id = "google-t5/t5-small"
     mini_data_id = 'uoft-cs/cifar10'
-    imagenet_id = 'ISLRVC/imagenet'
+    imagenet_id = "ILSVRC/imagenet-1k"
     device_0 = jax.default_device()
 
 randkey = jrand.key(config.seed)
@@ -216,10 +219,102 @@ def save_image_grid(batch, file_path: str, grid_size=None):
     return file_path
 
 
+def vae_encode(vae: AutoencoderKL, img_array: Array):
+    tensor_img = torch.from_numpy(np.array(img_array))
+    latent = vae.encode(tensor_img).latent_dist.sample().mul_(config.vaescale_factor)
+    np_latent = jnp.asarray(latent.numpy())
+    
+    return np_latent
+
+def rsync_checkpoint(
+    source_path: Union[str, Path],
+    remote_host: str,
+    remote_path: str,
+    ssh_key_path: Optional[str] = None,
+    exclude_patterns: Optional[List[str]] = None,
+    ssh_port: int = 22,
+    compress: bool = True,
+    dry_run: bool = False
+) -> bool:
+    """
+    Syncs training checkpoints to a remote machine using rsync over SSH.
+    
+    Args:
+        source_path (Union[str, Path]): Local path to sync (file or directory)
+        remote_host (str): Remote host (e.g., 'username@hostname' or 'hostname')
+        remote_path (str): Destination path on remote host
+        ssh_key_path (Optional[str]): Path to SSH private key file
+        exclude_patterns (Optional[List[str]]): Patterns to exclude from sync
+        ssh_port (int): SSH port number (default: 22)
+        compress (bool): Whether to compress data during transfer
+        dry_run (bool): If True, show what would be transferred without actual transfer
+    
+    Returns:
+        bool: True if sync was successful, False otherwise
+    """
+    try:
+        # Convert source path to string if it's a Path object
+        source_path = str(source_path)
+        
+        # Build the rsync command
+        rsync_cmd = ["rsync"]
+        
+        # Add rsync options
+        rsync_options = ["-avP"]  # archive mode and verbose
+        
+        if compress:
+            rsync_options.append("-z")  # compression
+        
+        if dry_run:
+            rsync_options.append("--dry-run")
+        
+        # Add SSH options
+        ssh_options = f"ssh -p {ssh_port}"
+        if ssh_key_path:
+            ssh_key_path = os.path.expanduser(ssh_key_path)
+            ssh_options += f" -i {ssh_key_path}"
+        
+        rsync_options.extend(["-e", ssh_options])
+        
+        # Add exclude patterns
+        if exclude_patterns:
+            for pattern in exclude_patterns:
+                rsync_options.extend(["--exclude", pattern])
+        
+        # Combine all parts of the command
+        rsync_cmd.extend(rsync_options)
+        rsync_cmd.extend([source_path, f"{remote_host}:{remote_path}"])
+        
+        # Setup logging
+        print(f"Starting rsync with command: {' '.join(rsync_cmd)}")
+        
+        # Execute rsync
+        result = subprocess.run(
+            rsync_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # Check if successful
+        if result.returncode == 0:
+            print("Rsync completed successfully")
+            if result.stdout:
+                print(f"Rsync stdout: {result.stdout}")
+            return True
+        else:
+            print(f"Rsync failed with return code {result.returncode}")
+            print(f"Error message: {result.stderr}")
+            return False
+            
+    except Exception as e:
+        print(f"Error during rsync: {str(e)}")
+        return False
+
 # T5 text encoder / VAE
 # t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)
 # t5_model = T5EncoderModel.from_pretrained(config.t5_id)
-# vae = AutoencoderKL.from_pretrained(config.vae_id).to(config.device_0)
+# vae = AutoencoderKL.from_pretrained(config.vae_id)
 
 # def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
 #     input_ids = tokenizer(text_input, return_tensors='np').input_ids  # Batch size 1
@@ -232,7 +327,7 @@ def save_image_grid(batch, file_path: str, grid_size=None):
 ###########################################################
 ## data loading
 image_data = load_dataset(config.mini_data_id, streaming=True, split='train', trust_remote_code=True).take(config.split)
-
+vae = AutoencoderKL.from_pretrained(config.vae_id)
 
 def load_image(url):
     image = pillow.open(urlopen(url=url))
@@ -242,10 +337,13 @@ def load_image(url):
     return resized / 255.0
 
 
-class ImageData(IterableDataset):
-    def __init__(self, dataset=image_data):
+class Text2ImageDataset(IterableDataset):
+    def __init__(self):
         super().__init__()
-        self.dataset = dataset
+        self.dataset = load_dataset(
+            config.pd12_id, streaming=True,
+            split='train', trust_remote_code=True
+        ).take(config.split)
 
     def __len__(self):
         return config.data_split
@@ -254,11 +352,10 @@ class ImageData(IterableDataset):
         for sample in self.dataset:
             image = sample["img_url"] # type: ignore
             image = load_image(image)
-            img_latents = vae.encode(image)
-            img_latents = img_latents.numpy()
+            img_latents = vae_encode(vae, image)
             caption_encoded = text_t5_encode(sample["caption"]) # type: ignore
 
-            image = jnp.array(image)
+            image = jnp.array(img_latents)
             text_encoding = jnp.array(caption_encoded)
 
             yield image, text_encoding
@@ -267,7 +364,9 @@ class ImageData(IterableDataset):
 class ImageClassData(IterableDataset):
     def __init__(self, dataset=image_data):
         super().__init__()
-        self.dataset = dataset
+        self.dataset = load_dataset(
+            config.imagenet_id, streaming=True, split="train", trust_remote_code=True
+        ).take(config.split)
 
     def __len__(self):
         return config.data_split
@@ -276,10 +375,10 @@ class ImageClassData(IterableDataset):
         for sample in self.dataset:
             image = sample["img"]  # type: ignore
             image = load_image(image)
-            # img_latents = vae.encode(torch.tensor(image))
-            # img_latents = img_latents.
+            
+            img_latents = vae_encode(vae, image)
 
-            image = jnp.array(image)
+            image = jnp.array(img_latents)
             label = jnp.array(sample["label"])
 
             yield image, label
@@ -293,9 +392,6 @@ def jax_collate(batch):
     return batch
 
 
-dataset = ImageClassData()
+dataset = ImageClassData() # imagenet dataset
 
 train_loader = DataLoader(dataset, batch_size=4, collate_fn=jax_collate)
-
-iv = next(iter(train_loader))
-iv[0].shape
