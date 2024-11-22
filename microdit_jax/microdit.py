@@ -82,7 +82,7 @@ class MicroDiT(nnx.Module):
             num_heads=attn_heads,
             mlp_dim=mlp_dim,
         )
-        
+
         self.final_linear = OutputMLP(embed_dim, patch_size=patch_size, out_channels=3)
 
     def unpatchify(self, x: Array) -> Array:
@@ -185,7 +185,6 @@ class MicroDiT(nnx.Module):
             t = i / sample_steps
             t = (
                 jnp.array([t] * b_size)
-                # .to_device(z_latent.device)
                 .astype(z_latent.dtype)
             )
 
@@ -194,7 +193,7 @@ class MicroDiT(nnx.Module):
             vu = self.__call__(z_latent, t, null_cond)
             vc = vu + cfg * (vc - vu)
 
-            z = z_latent - dt * vc
-            images.append(z)
+            z_latent = z_latent - dt * vc
+            images.append(z_latent)
 
         return images  # [-1]# / config.vaescale_factor

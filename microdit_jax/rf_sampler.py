@@ -77,17 +77,17 @@ class RectFlowWrapper(nnx.Module):
     #             [genstep] * batch_size
     #         )  # .to_device(input_noise.device)
 
-        #     cond_output = self.model(
-        #         input_noise, genstep_batched, cond
-        #     )  # get model output for step
+    #     cond_output = self.model(
+    #         input_noise, genstep_batched, cond
+    #     )  # get model output for step
 
-        #     if zero_cond is not None:
-        #         # output for zero conditioning
-        #         uncond_output = self.model(input_noise, genstep_batched, zero_cond)
-        #         cond_output = uncond_output + cfg * (cond_output - uncond_output)
+    #     if zero_cond is not None:
+    #         # output for zero conditioning
+    #         uncond_output = self.model(input_noise, genstep_batched, zero_cond)
+    #         cond_output = uncond_output + cfg * (cond_output - uncond_output)
 
-        #     out_noise = input_noise - d_steps * cond_output
+    #     input_noise = input_noise - d_steps * cond_output
 
-        #     images.append(out_noise)
+    #     images.append(input_noise)
 
-        # return images
+    # return images
