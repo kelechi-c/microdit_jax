@@ -4,7 +4,7 @@ from jax import random as jrand
 from tqdm.auto import tqdm
 from functools import partial
 from diffusers import AutoencoderKL
-from .data_utils import config, train_loader, random_mask, save_image_grid, save_paramdict_pickle
+from .data_utils import config, train_loader, random_mask, save_image_grid, save_paramdict_pickle, rsync_checkpoint
 from .microdit import MicroDiT 
 from .rf_sampler import RectFlowWrapper
 
@@ -31,6 +31,8 @@ microdit = MicroDiT(
 )
 
 rf_engine = RectFlowWrapper(microdit)
+vae = AutoencoderKL.from_pretrained(config.vae_id)
+
 state = nnx.state(rf_engine)
 
 n_params = sum([p.size for p in jax.tree.leaves(state)])
@@ -45,13 +47,15 @@ def wandb_logger(key: str, project_name, run_name):  # wandb logger
     wandb.init(project=project_name, name=run_name)
 
 def sample_image_batch(step):
-    classes = [1, 2, 3, 4]
-    randnoise = jrand.normal(randkey, (len(classes), 32, 32, 3))
+    classin = [1, 2, 3, 4]
+    
+    randnoise = jrand.normal(randkey, (len(classin), 32, 32, config.vae_channels))
     image_batch = rf_engine.model.sample(randnoise, classin)
+    samples = vae.decode(samples / 0.18215).sample
     gridfile = save_image_grid(image_batch, f'dit_output@{step}.png')
-    wandb.log(
+    wandb.log({
         'image': wandb.Image(data_or_path=gridfile)
-    ) 
+    }) 
 
 
 @nnx.jit
@@ -95,7 +99,24 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
                 gridfile = sample_image_batch(step)
                 image_log = wandb.Image(gridfile)
                 # wandb.log({'image_sample': image_log})
+                           # Sync to your local machine
+            if step % 10_000:
+                checkpoint_path = save_paramdict_pickle(model, f'microdit_{epoch}-{step}_{train_loss}.pkl')
+                success = rsync_checkpoint(
+                    source_path=checkpoint_path,
+                    remote_host="kelechi@pop-os",
+                    remote_path="/home/kelechi/model_backups/",
+                    ssh_key_path="~/.ssh/id_rsa",
+                    exclude_patterns=["*.tmp", "*.log"],
+                    compress=True
+                )
                 
+                if not success:
+                    print(f"Failed to sync checkpoint at epoch {epoch} / step {step}")
+                else:
+                    print(f"Successfully synced checkpoint at epoch {epoch}")
+
+
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
         save_paramdict_pickle(model, f'microdit_cifar_{epoch}_{train_loss}.pkl')
