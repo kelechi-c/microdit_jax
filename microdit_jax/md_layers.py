@@ -1,12 +1,12 @@
 import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from flax import nnx
-from .data_utils import nearest_divisor
+from .data_utils import nearest_divisor, config
 from .attention_mlp import SelfAttention, SimpleMLP
 
-rkey = jrand.key(3)
-rngs = nnx.Rngs(3)
-randkey = jrand.key(3)
+rkey = jrand.key(config.seed)
+rngs = nnx.Rngs(config.seed)
+randkey = jrand.key(config.seed)
 
 # init values
 xavier_init = nnx.initializers.xavier_uniform()
@@ -19,10 +19,10 @@ class PatchEmbed(nnx.Module):
     def __init__(
         self,
         rngs: nnx.Rngs=rngs,
-        patch_size = 4,
-        img_size = 256,
-        in_chan: int = 3,
-        embed_dim: int = 768,
+        patch_size = 2,
+        img_size = 32,
+        in_chan: int = 4,
+        embed_dim: int = 1024,
     ):
         super().__init__()
         self.patch_size = (patch_size, patch_size)
@@ -353,7 +353,7 @@ class CaptionEmbedder(nnx.Module):
 # DiT blocks_ #
 ###############
 class DiTBlock(nnx.Module):
-    def __init__(self, hidden_size=1024, num_heads=6, num_experts=4, mlp_ratio=4, experts_pertok=2):
+    def __init__(self, hidden_size=1024, num_heads=6, mlp_ratio=4):
         super().__init__()
 
         # initializations

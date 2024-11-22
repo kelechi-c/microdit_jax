@@ -21,12 +21,12 @@ for device in devices:
 
 # wandb.Image()
 microdit = MicroDiT(
-    inchannels=3,
-    patch_size=(4, 4),
+    inchannels=4,
+    patch_size=(2, 2),
     embed_dim=1024,
-    num_layers=4,
-    attn_heads=8,
-    mlp_dim=1 * 1024,
+    num_layers=12,
+    attn_heads=12,
+    mlp_dim=4 * 1024,
     cond_embed_dim=1024,
 )
 

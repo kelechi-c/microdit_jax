@@ -1,8 +1,5 @@
-import flax.linen
-import jax, math
-from jax import Array, numpy as jnp, random as jrand
+from jax import Array, numpy as jnp
 from flax import nnx
-from einops import rearrange
 
 from .data_utils import add_masked_patches, config, remove_masked_patches
 from .attention_mlp import OutputMLP
@@ -13,7 +10,7 @@ from .md_layers import (
     LabelEmbedder, TransformerBackbone
 )
 
-rngs = nnx.Rngs(3)
+rngs = nnx.Rngs(config.seed)
 
 # patch mixer module
 class PatchMixer(nnx.Module):
@@ -45,7 +42,7 @@ class MicroDiT(nnx.Module):
         dropout=0.1,
         patchmix_layers=2,
         rngs=rngs,
-        num_classes=10,
+        num_classes=1000,
     ):
         super().__init__()
         self.patch_size = patch_size
@@ -83,7 +80,7 @@ class MicroDiT(nnx.Module):
             mlp_dim=mlp_dim,
         )
 
-        self.final_linear = OutputMLP(embed_dim, patch_size=patch_size, out_channels=3)
+        self.final_linear = OutputMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
     def unpatchify(self, x: Array) -> Array:
 
