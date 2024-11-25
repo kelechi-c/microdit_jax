@@ -25,6 +25,20 @@ class OutputMLP(nnx.Module):
 
         return x
 
+class SimpleMLP(nnx.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
+        self.linear_2 = nnx.Linear(
+            embed_dim, embed_dim,
+            rngs=rngs
+        )
+
+    def __call__(self, x: Array) -> Array:
+        x = nnx.gelu(self.linear_1(x))
+        x = self.linear_2(x)
+
+        return x
 
 # Pool + MLP for (MHA + MLP)
 class PoolMLP(nnx.Module):
