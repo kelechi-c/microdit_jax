@@ -1,7 +1,8 @@
 from jax import Array, numpy as jnp, random as jrand
-import flax, cv2, jax, pickle, os
+import flax, cv2, jax, pickle, torch
 import numpy as np
 from flax import nnx
+from einops import rearrange
 from datasets import load_dataset
 from torch.utils.data import DataLoader, IterableDataset
 from collections import namedtuple
@@ -14,21 +15,18 @@ from transformers import AutoTokenizer, T5EncoderModel
 from urllib.request import urlopen
 import matplotlib.pyplot as plt
 import numpy as np
-import subprocess, torch
-from typing import Optional, Union, List
-from pathlib import Path
 
 
 class config:
     vaescale_factor = 0.13025
     batch_size = 128
-    img_size = 256
+    img_size = 256 # 256 for imagenet, 32 for cifar/vae latents 
     seed = 33
     patch_size = (4, 4)
     lr = 1e-4
     mask_ratio = 0.75
     epochs = 5
-    data_split = 10_000
+    data_split = 10_000 # for mini-testing I use 10k samples 
     cfg_scale = 2.0
     vae_channels = 4
     celebv_id = 'SwayStar123/CelebV-HQ'
@@ -221,95 +219,12 @@ def save_image_grid(batch, file_path: str, grid_size=None):
 
 def vae_encode(vae: AutoencoderKL, img_array: Array):
     tensor_img = torch.from_numpy(np.array(img_array))
+    tensor_img = rearrange(tensor_img, 'b h w c -> b c h w')
     latent = vae.encode(tensor_img).latent_dist.sample().mul_(config.vaescale_factor)
     np_latent = jnp.asarray(latent.numpy())
-    
+    np_latent = rearrange(np_latent, "b c h w -> b h w c")
     return np_latent
 
-def rsync_checkpoint(
-    source_path: Union[str, Path],
-    remote_host: str,
-    remote_path: str,
-    ssh_key_path: Optional[str] = None,
-    exclude_patterns: Optional[List[str]] = None,
-    ssh_port: int = 22,
-    compress: bool = True,
-    dry_run: bool = False
-) -> bool:
-    """
-    Syncs training checkpoints to a remote machine using rsync over SSH.
-    
-    Args:
-        source_path (Union[str, Path]): Local path to sync (file or directory)
-        remote_host (str): Remote host (e.g., 'username@hostname' or 'hostname')
-        remote_path (str): Destination path on remote host
-        ssh_key_path (Optional[str]): Path to SSH private key file
-        exclude_patterns (Optional[List[str]]): Patterns to exclude from sync
-        ssh_port (int): SSH port number (default: 22)
-        compress (bool): Whether to compress data during transfer
-        dry_run (bool): If True, show what would be transferred without actual transfer
-    
-    Returns:
-        bool: True if sync was successful, False otherwise
-    """
-    try:
-        # Convert source path to string if it's a Path object
-        source_path = str(source_path)
-        
-        # Build the rsync command
-        rsync_cmd = ["rsync"]
-        
-        # Add rsync options
-        rsync_options = ["-avP"]  # archive mode and verbose
-        
-        if compress:
-            rsync_options.append("-z")  # compression
-        
-        if dry_run:
-            rsync_options.append("--dry-run")
-        
-        # Add SSH options
-        ssh_options = f"ssh -p {ssh_port}"
-        if ssh_key_path:
-            ssh_key_path = os.path.expanduser(ssh_key_path)
-            ssh_options += f" -i {ssh_key_path}"
-        
-        rsync_options.extend(["-e", ssh_options])
-        
-        # Add exclude patterns
-        if exclude_patterns:
-            for pattern in exclude_patterns:
-                rsync_options.extend(["--exclude", pattern])
-        
-        # Combine all parts of the command
-        rsync_cmd.extend(rsync_options)
-        rsync_cmd.extend([source_path, f"{remote_host}:{remote_path}"])
-        
-        # Setup logging
-        print(f"Starting rsync with command: {' '.join(rsync_cmd)}")
-        
-        # Execute rsync
-        result = subprocess.run(
-            rsync_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        # Check if successful
-        if result.returncode == 0:
-            print("Rsync completed successfully")
-            if result.stdout:
-                print(f"Rsync stdout: {result.stdout}")
-            return True
-        else:
-            print(f"Rsync failed with return code {result.returncode}")
-            print(f"Error message: {result.stderr}")
-            return False
-            
-    except Exception as e:
-        print(f"Error during rsync: {str(e)}")
-        return False
 
 # T5 text encoder / VAE
 # t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)
@@ -332,9 +247,9 @@ vae = AutoencoderKL.from_pretrained(config.vae_id)
 def load_image(url):
     image = pillow.open(urlopen(url=url))
     img_array = np.array(image)
-    resized = cv2.resize(img_array, dsize=(config.img_size, config.img_size))
+    # resized = cv2.resize(img_array, dsize=(config.img_size, config.img_size))
 
-    return resized / 255.0
+    return img_array / 255.0
 
 
 class Text2ImageDataset(IterableDataset):
@@ -392,6 +307,6 @@ def jax_collate(batch):
     return batch
 
 
-dataset = ImageClassData() # imagenet dataset
+dataset = ImageClassData() # imagenet/cifar dataset
 
-train_loader = DataLoader(dataset, batch_size=4, collate_fn=jax_collate)
+train_loader = DataLoader(dataset, batch_size=config.batch_size, collate_fn=jax_collate)
