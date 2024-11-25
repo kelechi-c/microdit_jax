@@ -1,5 +1,5 @@
 import jax, math, flax
-import os, wandb, time, pickle, cloudpickle
+import os, wandb, time, pickle
 from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
@@ -9,11 +9,9 @@ from einops import rearrange
 from tqdm.auto import tqdm
 from typing import List
 from torch.utils.data import DataLoader, IterableDataset
-from collections import namedtuple
 import flax.traverse_util
 from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
-import safetensors.flax as safejax
 import matplotlib.pyplot as plt
 from datasets import load_dataset
 import warnings
@@ -56,42 +54,6 @@ print(f"found {num_devices} JAX device")
 for device in devices:
     print(f"{device} \n")
 
-# jax/numpy implementation of topk selection
-def jnp_topk(array: Array, k: int):
-    topk_tuple = namedtuple("topk", ["values", "ids"])
-    array = jnp.asarray(array)
-    flat = array.ravel()
-
-    sort_indices = jnp.argpartition(flat, -k)[-k:]
-    argsort = jnp.argsort(-flat[sort_indices])  # get sorting ids
-
-    sort_idx = sort_indices[argsort]
-    values = flat[sort_idx]
-
-    idx = jnp.unravel_index(sort_idx, array.shape)
-
-    if len(idx) == 1:
-        (idx,) = idx
-
-    return topk_tuple(values=values, ids=idx)
-
-
-# save model params in safetensors file
-def save_model(model: nnx.Module, file: str, dtype):
-    _, state = nnx.split(model)
-    params = state.filter(nnx.Param)
-    state_dict = to_state_dict(params)
-
-    state_dict = flax.traverse_util.flatten_dict(state_dict, sep=".")
-
-    for key in list(state_dict.keys()):
-        if not isinstance(state_dict[key], Array):
-            state_dict[key] = jnp.array(state_dict[key])  # type: ignore
-
-        state_dict[key] = state_dict[key].astype(dtype)  # type: ignore
-
-    safejax.save_file(state_dict, file)  # type: ignore
-
 
 def apply_mask(x: Array, mask, patch_size):
     # basically turns the masked values to 0s
@@ -128,16 +90,6 @@ def random_mask(bs, height, width, patch_size, mask_ratio):
     return mask
 
 
-def nearest_divisor(scaled_num_heads, embed_dim):
-    # Find all divisors of embed_dim
-    divisors = [k for k in range(1, embed_dim + 1) if embed_dim % k == 0]
-
-    # Find the nearest divisor
-    nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-
-    return nearest
-
-
 def remove_masked_patches(patches: Array, mask: Array):
     # Convert and invert mask
     mask = jnp.logical_not(mask)
@@ -158,47 +110,22 @@ def remove_masked_patches(patches: Array, mask: Array):
 def add_masked_patches(patches: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
     # Ensure mask is a boolean tensor
     mask = mask.astype(jnp.bool_)
-
     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
-
     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
-
-    # full_patches = full_patches.at[mask].set(patches.reshape(-1, embed_dim))
     reshaped_patches = patches.reshape(-1, embed_dim)
-
-    # print(f'{reshaped_patches.shape = }')
-    # print(f'{full_patches.shape = }')
-    # print(f'{patches.shape = }')
-    # print(f'{mask.shape = }')
-
     full_patches = jnp.where(mask[..., None], reshaped_patches, full_patches)
 
     return full_patches
 
-# T5 text encoder
-# t5_tokenizer = AutoTokenizer.from_pretrained(config.t5_id)
-# t5_model = T5EncoderModel.from_pretrained(config.t5_id)
-
-
-# def text_t5_encode(text_input: str, tokenizer=t5_tokenizer, model=t5_model):
-#     input_ids = tokenizer(text_input, return_tensors="np").input_ids  # Batch size 1
-#     outputs = model(input_ids=input_ids)
-#     last_hidden_states = outputs.last_hidden_state
-
-#     return last_hidden_states
 
 ## data loading
 image_data = load_dataset(
     config.mini_data_id, streaming=True, split="train", trust_remote_code=True
 ).take(config.data_split)
 
-# vae = AutoencoderKL.from_pretrained(config.vae_id)#.to(config.device_0)
 
 def load_image(image):
-    # image = pillow.open(urlopen(url=url))
     img_array = np.array(image)
-    # resized = cv2.resize(img_array, dsize=(config.img_size, config.img_size))
-
     return img_array / 255.0
 
 class ImageClassData(IterableDataset):
@@ -233,7 +160,7 @@ dataset = ImageClassData()
 train_loader = DataLoader(dataset, batch_size=128, collate_fn=jax_collate)
 
 iv = next(iter(train_loader))
-iv[0].shape
+
 
 # modulation with shift and scale
 def modulate(x_array: Array, shift, scale) -> Array:
@@ -242,8 +169,7 @@ def modulate(x_array: Array, shift, scale) -> Array:
 
     return x
 
-
-# equivalnet of F.lineat
+# equivalnet of F.linear
 def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
     out = jnp.dot(array, weight)
 
@@ -285,11 +211,6 @@ def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
 
 
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
     assert embed_dim % 2 == 0
     omega = jnp.arange(embed_dim // 2, dtype=jnp.float64)
     omega /= embed_dim / 2.0
@@ -312,7 +233,6 @@ linear_init = nnx.initializers.xavier_uniform()
 linear_bias_init = nnx.initializers.constant(1)
 
 # input patchify layer, 2D image to patches
-
 class PatchEmbed(nnx.Module):
     def __init__(
         self,
@@ -343,8 +263,6 @@ class PatchEmbed(nnx.Module):
 
         # Reshape to (batch_size, num_patches, embed_dim)
         batch_size, h, w, embed_dim = x.shape
-        # num_patches = h * w
-        # x = x.transpose(0, 2, 3, 1)  # Shape: (batch_size, height, width, embed_dim)
         x = x.reshape(batch_size, -1)  # Shape: (batch_size, num_patches, embed_dim)
 
         return x
@@ -1196,14 +1114,12 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
             print(f"step {step}, loss-> {train_loss.item():.4f}")
             wandb.log({"loss": train_loss.item()})
 
-            if step % 20 == 0:
-                # model.eval()
+            if step % 50 == 0:
                 gridfile = sample_image_batch(step)
                 image_log = wandb.Image(gridfile)
                 wandb.log({'image_sample': image_log})
                 path = f"microdit_cifar20_{step}_{epoch}_{train_loss}.pkl"
                 save_paramdict_pickle(model, path)
-                # model.train()
 
             jax.clear_caches()
             jax.clear_backends()
@@ -1212,24 +1128,18 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
         print(f"epoch {epoch+1}, train loss => {train_loss}")
         path = f"microdit_cifar_{epoch}_{len(train_loader)}_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
-        success = rsync_checkpoint(
-            source_path=path,
-            remote_host="kelechi@pop-os",
-            remote_path="/home/kelechi/model_backups/",
-            ssh_key_path="~/.ssh/id_rsa",
-            exclude_patterns=["*.tmp", "*.log"],
-            compress=True
-        )
+
             
     etime = time.time() - stime
     print(f"training time for {epochs} epochs -> {etime}s / {etime/60} mins")
-    # path = f"microdit_cifar_full_{len(train_loader)*epochs}_{train_loss}.pkl"
+    checkfile = f"microdit_cifar_all_steps_{len(train_loader)*epochs}_{train_loss}.pkl"
+    
+    save_paramdict_pickle(model, checkfile)
 
-    save_paramdict_pickle(model, f"microdit_cifar_all_steps_{len(train_loader)*epochs}_{train_loss}.pkl")
-
-    return model
+    return model, checkfile
 
 
-trainer()
+trained_model, model_checkpoint = trainer()
+
 # wandb.finish()
 print("microdit test training in JAX..done")
