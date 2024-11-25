@@ -1053,93 +1053,6 @@ XLA_PYTHON_CLIENT_MEM_FRACTION = 0.30
 jax.clear_caches()
 gc.collect()
 
-import subprocess
-
-def rsync_checkpoint(
-    source_path,
-    remote_host: str,
-    remote_path: str,
-    ssh_key_path = None,
-    exclude_patterns = None,
-    ssh_port: int = 22,
-    compress: bool = True,
-    dry_run: bool = False
-) -> bool:
-    """
-    Syncs training checkpoints to a remote machine using rsync over SSH.
-    
-    Args:
-        source_path (Union[str, Path]): Local path to sync (file or directory)
-        remote_host (str): Remote host (e.g., 'username@hostname' or 'hostname')
-        remote_path (str): Destination path on remote host
-        ssh_key_path (Optional[str]): Path to SSH private key file
-        exclude_patterns (Optional[List[str]]): Patterns to exclude from sync
-        ssh_port (int): SSH port number (default: 22)
-        compress (bool): Whether to compress data during transfer
-        dry_run (bool): If True, show what would be transferred without actual transfer
-    
-    Returns:
-        bool: True if sync was successful, False otherwise
-    """
-    try:
-        # Convert source path to string if it's a Path object
-        source_path = str(source_path)
-        
-        # Build the rsync command
-        rsync_cmd = ["rsync"]
-        
-        # Add rsync options
-        rsync_options = ["-avP"]  # archive mode and verbose
-        
-        if compress:
-            rsync_options.append("-z")  # compression
-        
-        if dry_run:
-            rsync_options.append("--dry-run")
-        
-        # Add SSH options
-        ssh_options = f"ssh -p {ssh_port}"
-        if ssh_key_path:
-            ssh_key_path = os.path.expanduser(ssh_key_path)
-            ssh_options += f" -i {ssh_key_path}"
-        
-        rsync_options.extend(["-e", ssh_options])
-        
-        # Add exclude patterns
-        if exclude_patterns:
-            for pattern in exclude_patterns:
-                rsync_options.extend(["--exclude", pattern])
-        
-        # Combine all parts of the command
-        rsync_cmd.extend(rsync_options)
-        rsync_cmd.extend([source_path, f"{remote_host}:{remote_path}"])
-        
-        # Setup logging
-        print(f"Starting rsync with command: {' '.join(rsync_cmd)}")
-        
-        # Execute rsync
-        result = subprocess.run(
-            rsync_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-        
-        # Check if successful
-        if result.returncode == 0:
-            print("Rsync completed successfully")
-            if result.stdout:
-                print(f"Rsync stdout: {result.stdout}")
-            return True
-        else:
-            print(f"Rsync failed with return code {result.returncode}")
-            print(f"Error message: {result.stderr}")
-            return False
-            
-    except Exception as e:
-        print(f"Error during rsync: {str(e)}")
-        return False
-
 def save_image_grid(batch, file_path: str, grid_size=None):
     batch = np.array(batch[-1])
     # Determine grid size
@@ -1197,9 +1110,6 @@ def sample_image_batch(step):
     image_batch = rf_engine.sample(randnoise, classin)
     gridfile = save_image_grid(image_batch, f'rf_dit_output@{step}.png')
     display_samples(image_batch)
-    # wandb.log({
-    #     'image': wandb.Image(data_or_path=gridfile)
-    # })
 
     return gridfile
 
@@ -1225,14 +1135,9 @@ def load_paramdict_pickle(model, filename="model.pkl"):
     with open(filename, "rb") as modelfile:
         params = pickle.load(modelfile)
         
-    # print(type(params))
     params = unfreeze(params)
-    # print(type(params))
     params = flax.traverse_util.unflatten_dict(params, sep=".")
-    # print(type(params))
     params = from_state_dict(model, params)
-    # print(type(params), type(model))
-
     nnx.update(model, params)
 
     return model, params
@@ -1240,12 +1145,12 @@ def load_paramdict_pickle(model, filename="model.pkl"):
 lastsaved = 'microdit_cifar_all_steps_395_1.2368513345718384.pkl'
 rf_engine, state = load_paramdict_pickle(rf_engine, lastsaved)
 
-# replicate model
+# replicate model across TPU devices
 state = nnx.state((rf_engine, optimizer))
 state = jax.device_put(state, model_sharding)
 nnx.update((rf_engine, optimizer), state)
 
-print(f'beginning training from {lastsaved}')
+print(f'resuming training from checkpoint: {lastsaved}')
 
 @nnx.jit
 def train_step(model, optimizer, batch):
@@ -1277,7 +1182,7 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
     train_loss = 0.0
     model.train()
     wandb_logger(
-        key='3aef5402e364c9da47508adf8be0664512ed30b2',
+        key='',
         project_name="microdit_jax",
         run_name="microdit-cifar20k-1e-3-tpu",
     )
