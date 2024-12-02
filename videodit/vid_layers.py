@@ -183,29 +183,23 @@ class MochiPatcher(nnx.Module):
         in_chans: int = 3,
         embed_dim: int = 768,
         flatten: bool = True,
-        bias: bool = True,
         dynamic_img_pad: bool = False,
     ):
         super().__init__()
+        
         self.patch_size = to_2tuple(patch_size)
         self.flatten = flatten
         self.dynamic_img_pad = dynamic_img_pad
 
-        self.proj = nn.Conv2d(
+        self.conv_proj = nnx.Conv(
             in_chans,
             embed_dim,
             kernel_size=patch_size,
-            stride=patch_size,
-            bias=bias,
-            device=device,
-        )
-        assert norm_layer is None
-        self.norm = (
-            norm_layer(embed_dim, device=device) if norm_layer else nn.Identity()
+            stride=patch_size
         )
 
-    def forward(self, x):
-        B, _C, T, H, W = x.shape
+    def forward(self, x: Array) -> Array:
+        B, T, H, W, C = x.shape
         if not self.dynamic_img_pad:
             assert (
                 H % self.patch_size[0] == 0
@@ -216,17 +210,16 @@ class MochiPatcher(nnx.Module):
         else:
             pad_h = (self.patch_size[0] - H % self.patch_size[0]) % self.patch_size[0]
             pad_w = (self.patch_size[1] - W % self.patch_size[1]) % self.patch_size[1]
-            x = F.pad(x, (0, pad_w, 0, pad_h))
+            x = jnp.pad(x, (0, pad_w, 0, pad_h))
 
-        x = rearrange(x, "B C T H W -> (B T) C H W", B=B, T=T)
-        x = self.proj(x)
+        x = rearrange(x, "B T H W C -> (B T) H W C", B=B, T=T)
+        x = self.conv_proj(x)
 
         # Flatten temporal and spatial dimensions.
         if not self.flatten:
             raise NotImplementedError("Must flatten output.")
-        x = rearrange(x, "(B T) C H W -> B (T H W) C", B=B, T=T)
-
-        x = self.norm(x)
+        x = rearrange(x, "(B T) H W C -> B (T H W) C", B=B, T=T)
+        
         return x
 
 
