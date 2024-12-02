@@ -266,7 +266,6 @@ class Attention(nnx.Module):
             bias_init=bias_init,
             kernel_init=linear_init
         )
-        
         self.dropout = nnx.Dropout(drop, rngs=rngs)
 
     def __call__(self, x_input: jax.A, y_cond: Array) -> jax.Array:
@@ -440,3 +439,17 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 
     emb = jnp.concatenate([emb_sin, emb_cos], axis=-1)  # (M, D)
     return emb
+
+
+class RMSNorm(nnx.Module):
+    def __init__(self, hidden_size, eps=1e-5, device=None):
+        super().__init__()
+        self.eps = eps
+        self.weight = nnx.Param(jnp.empty(hidden_size, device=device))
+        self.register_parameter("bias", None)
+
+    def forward(self, x):
+        x_fp32 = x.float()
+        x_normed = x_fp32 * (1 / jnp.sqrt(x_fp32.pow(2).mean(-1, keepdim=True) + self.eps))
+        
+        return (x_normed * self.weight)
