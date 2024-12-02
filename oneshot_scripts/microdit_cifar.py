@@ -2,6 +2,7 @@
 Training a MicroDIT model, DiT-B(base) config for 30 epochs on cifar-10
 '''
 
+import flax.jax_utils
 import jax, math, flax
 import os, wandb, time, pickle
 from jax import Array, numpy as jnp, random as jrand
@@ -150,8 +151,10 @@ def jax_collate(batch):
 
 dataset = ImageClassData()
 
-train_loader = DataLoader(dataset, batch_size=128, collate_fn=jax_collate)
+train_loader = DataLoader(dataset, batch_size=128, collate_fn=jax_collate, num_workers=4)
 
+# flax.jax_utils.replicate(state, jax.devices())
+nnx.st
 
 # modulation with shift and scale
 def modulate(x_array: Array, shift, scale) -> Array:
@@ -705,38 +708,7 @@ class TransformerBackbone(nnx.Module):
             kernel_init=nnx.initializers.xavier_uniform(),
         )
 
-        # # Define scaling ranges for m_f and m_a
-        # mf_min, mf_max = 0.5, 4.0
-        # ma_min, ma_max = 0.5, 1.0
-
         self.layers = [DiTBlock(embed_dim, num_heads) for _ in range(num_layers)]
-
-        # for v in range(num_layers):
-        # self.layers.append()
-        # # Calculate scaling factors for the v-th layer using linear interpolation
-        # mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
-        # ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
-
-        # # Scale the dimensions according to the scaling factors
-        # scaled_mlp_dim = int(mlp_dim * mf)
-        # scaled_num_heads = max(1, int(num_heads * ma))
-        # scaled_num_heads = nearest_divisor(scaled_num_heads, embed_dim)
-        # mlp_ratio = int(scaled_mlp_dim / embed_dim)
-
-        # # Choose layer type based on the layer index (even/odd)
-        # if v % 2 == 0:  # Even layers use regular DiT blocks
-        #     self.layers.append(
-        #        DiTBlock(embed_dim, scaled_num_heads, mlp_ratio)
-        #     )
-        # else:  # Odd layers use MoE DiT block
-        #     self.layers.append(
-        #         DiTBlock(
-        #             embed_dim,
-        #             scaled_num_heads,
-        #             mlp_ratio,
-
-        #         )
-        #     )
 
         self.output_layer = nnx.Linear(
             embed_dim,
@@ -749,7 +721,6 @@ class TransformerBackbone(nnx.Module):
         x = self.input_embedding(x)
         class_emb = self.class_embedding(c_emb)
 
-        # print(f'class embed :{class_emb}')
         for layer in self.layers:
             x = layer(x, class_emb)
 

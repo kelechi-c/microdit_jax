@@ -139,10 +139,6 @@ microdit = MicroDiT(
 )
 
 rf_engine = RectFlowWrapper(microdit)
-graph, state = nnx.split(rf_engine)
-
-n_params = sum([p.size for p in jax.tree.leaves(state)])
-print(f"number of parameters: {n_params/1e6:.3f}M")
 
 
 def save_image_grid(batch, file_path: str, grid_size=None):
@@ -174,15 +170,13 @@ def save_image_grid(batch, file_path: str, grid_size=None):
     return file_path
 
 
-def display_samples(sample_batch):
+def display_samples(sample_batch): # works for jupyter-notebook output
     batch = np.array(sample_batch[-1])
     # Set up the grid
     batch_size = batch.shape[0]
-
     grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
 
     fig, axes = plt.subplots(grid_size, grid_size, figsize=(10, 10))
-
     # Plot each image
     for i, ax in enumerate(axes.flat):
         if i < batch_size:
@@ -197,12 +191,12 @@ def display_samples(sample_batch):
 
 
 def sample_image_batch(model, class_ids):
-    classin = jnp.array(class_ids)  # 76, 292, 293, 979, 968 imagenet
+    classin = jnp.array(class_ids)
     randnoise = jrand.normal(
         randkey, (len(classin), config.img_size, config.img_size, 3)
     )
     image_batch = model.sample(randnoise, classin)
-    gridfile = save_image_grid(image_batch, "microdit_output.png")
+    gridfile = save_image_grid(image_batch, "dit_samples/microdit_output.png")
 
     return gridfile
 
@@ -211,16 +205,17 @@ import pickle
 def load_paramdict_pickle(model, filename="model.pkl"):
     with open(filename, "rb") as modelfile:
         params = pickle.load(modelfile)
-
     params = unfreeze(params)
     params = flax.traverse_util.unflatten_dict(params, sep=".")
     params = from_state_dict(model, params)
     nnx.update(model, params)
     return model
 
+cifar_classes = [1, 2, 3, 4, 5, 6, 7, 8, 9]
+imagenet_classes = [76, 292, 293, 979, 968, 500, 33, 179, 333]
 
-def inference_dit(model, ckpt_file, classes=[1, 2, 3, 4, 5, 6, 7, 8, 9]):
+
+def inference_dit(model, ckpt_file, classes=cifar_classes):
     model = load_paramdict_pickle(model, ckpt_file)
     sample_file = sample_image_batch(model, classes)
     return sample_file
-    
