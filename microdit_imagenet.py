@@ -463,21 +463,6 @@ class PoolMLP(nnx.Module):
         return x
 
 
-class OutputMLP(nnx.Module):
-    def __init__(self, embed_dim, patch_size, out_channels):
-        super().__init__()
-        self.linear_1 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-        self.linear_2 = nnx.Linear(
-            embed_dim, patch_size[0] * patch_size[1] * out_channels, rngs=rngs
-        )
-
-    def __call__(self, x: Array) -> Array:
-        x = nnx.gelu(self.linear_1(x))
-        x = self.linear_2(x)
-
-        return x
-
-
 ###############
 # DiT blocks_ #
 ###############
@@ -543,11 +528,12 @@ class FinalMLP(nnx.Module):
         self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
         self.linear = nnx.Linear(
             hidden_size,
-            patch_size * patch_size * out_channels,
+            patch_size[0] * patch_size[1] * out_channels,
             rngs=rngs,
             kernel_init=nnx.initializers.xavier_uniform(),
-            bias_init=linear_init,
+            bias_init=linear_init
         )
+        
         self.adaln_linear = nnx.Linear(
             hidden_size,
             2 * hidden_size,
@@ -711,7 +697,7 @@ class MicroDiT(nnx.Module):
             num_heads=attn_heads,
         )
 
-        self.final_linear = OutputMLP(embed_dim, patch_size=patch_size, out_channels=4)
+        self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
     def unpatchify(self, x: Array) -> Array:
         bs, num_patches, patch_dim = x.shape
@@ -877,7 +863,6 @@ class RectFlowWrapper(nnx.Module):
         mean_dim = list(
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
-        # print(f'z_noise {z_noise.shape}, vtheta {v_thetha.shape}, x_input {x_input.shape}')
 
         x_input = apply_mask(x_input, mask, config.patch_size)
         v_thetha = apply_mask(v_thetha, mask, config.patch_size)
