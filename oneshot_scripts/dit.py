@@ -17,7 +17,7 @@ from flax.core import freeze, unfreeze
 from einops import rearrange
 
 import os, wandb, time, pickle, gc
-import math, flax, torch
+import math, flax, torch, optax
 from tqdm.auto import tqdm
 from typing import List, Any
 from torch.utils.data import DataLoader, DistributedSampler
@@ -451,7 +451,7 @@ class DiT(nnx.Module):
 
         return reconstructed
 
-    def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
+    def __call__(self, x: Array, t: Array, y_cap: Array):
         bsize, height, width, channels = x.shape
         psize_h, psize_w = self.patch_size
 
@@ -471,9 +471,8 @@ class DiT(nnx.Module):
 
         x = x + pos_embed
 
-        # cond_embed = self.cap_embedder(y_cap) # (b, embdim)
+        # text_embed = self.cap_embedder(y_cap) # (b, embdim)
         class_embed = self.label_embedder(y_cap, train=True)
-
         time_embed = self.time_embedder(t)
 
         cond_signal = class_embed + time_embed
@@ -510,55 +509,13 @@ class DiT(nnx.Module):
         return images[-1] / config.vaescale_factor
 
 
-import optax
-
-
-def apply_mask(x, mask, patch_size):
-    """
-    Applies a mask to a tensor with channels-last format. Turns the masked values to 0s.
-
-    Args:
-        x: JAX array of shape (bs, h, w, c)
-        mask: JAX array of shape (bs, num_patches)
-        patch_size: Tuple of patch height and width
-
-    Returns:
-        JAX array of shape (bs, h, w, c) with the masked values turned to 0s.
-    """
-
-    bs, h, w, c = x.shape
-    num_patches_h, num_patches_w = h // patch_size[0], w // patch_size[1]
-
-    # Ensure that height and width are divisible by patch_size
-    assert (
-        h % patch_size[0] == 0 and w % patch_size[1] == 0
-    ), "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(
-        h, w, patch_size
-    )
-
-    # Reshape mask to (bs, num_patches_h, num_patches_w)
-    mask = mask.reshape((bs, num_patches_h, num_patches_w))
-    # print(f"x in => {x.shape}, mask => {mask.shape}")
-
-    # Expand the mask to cover each patch
-    # (bs, num_patches_h, num_patches_w) -> (bs, h, w, 1)
-    mask = jnp.expand_dims(mask, axis=3)  # Add channel dimension
-    mask = jnp.repeat(mask, patch_size[0], axis=1)  # Repeat for patch_size height
-    mask = jnp.repeat(mask, patch_size[1], axis=2)  # Repeat for patch_size width
-
-    # Apply the mask to the input tensor
-    x = x * mask
-
-    return x
-
-
 # rectifed flow forward pass, loss, and sampling
 class RectFlowWrapper(nnx.Module):
     def __init__(self, model: nnx.Module, sigln: bool = True):
         self.model = model
         self.sigln = sigln
 
-    def __call__(self, x_input: Array, cond: Array, mask) -> Array:
+    def __call__(self, x_input: Array, cond: Array) -> Array:
         b_size = x_input.shape[0]  # batch_size
         rand_t = None
 
@@ -571,11 +528,7 @@ class RectFlowWrapper(nnx.Module):
         z_noise = jrand.uniform(randkey, x_input.shape)  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
-        v_thetha = self.model(z_noise_t, rand_t, cond, mask)
-
-        x_input = apply_mask(x_input, mask, config.patch_size)
-        v_thetha = apply_mask(v_thetha, mask, config.patch_size)
-        z_noise = apply_mask(z_noise, mask, config.patch_size)
+        v_thetha = self.model(z_noise_t, rand_t, cond)
 
         mean_dim = list(range(1, len(x_input.shape)))  # across all dimensions except the batch dim
 
@@ -624,10 +577,9 @@ rf_engine = RectFlowWrapper(dit)
 graph, state = nnx.split(rf_engine)
 
 n_params = sum([p.size for p in jax.tree.leaves(state)])
-print(f"number of parameters: {n_params/1e6:.2f}M")
+print(f"number of parameters: {n_params/1e6:.1f}M")
 
 optimizer = nnx.Optimizer(rf_engine, optax.adamw(learning_rate=config.lr))
-
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
     # initilaize wandb
@@ -681,64 +633,10 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     return file
 
 
-def save_image_grid(batch, file_path: str, grid_size=None):
-    # batch = process_img(batch)
-    # Determine grid size
-    batch_size = batch.shape[0]
-    if grid_size is None:
-        grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
-        rows, cols = grid_size, grid_size
-    else:
-        rows, cols = grid_size
-
-    # Set up the grid
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-
-    # Plot each image
-    for i, ax in enumerate(axes.flat):
-        if i < batch_size:
-            image = process_img(batch[i])
-            # image = np.clip(image, 0, 1)
-            # img = (image * 255).astype(np.uint8)  # Scale image to 0-255
-            ax.imshow(np.array(image))
-            ax.axis("off")
-        else:
-            ax.axis("off")  # Hide unused subplots
-
-    plt.tight_layout()
-    plt.savefig(file_path, bbox_inches="tight")
-    plt.close(fig)
-
-    return file_path
-
-
-def display_samples(sample_batch):
-    batch = np.array(sample_batch)
-    # Set up the grid
-    batch_size = batch.shape[0]
-
-    grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
-
-    fig, axes = plt.subplots(grid_size, grid_size, figsize=(10, 10))
-
-    # Plot each image
-    for i, ax in enumerate(axes.flat):
-        if i < batch_size:
-            img = process_img(batch[i])
-            ax.imshow(img)
-            ax.axis("off")
-        else:
-            ax.axis("off")  # Hide unused subplots
-
-    plt.tight_layout()
-    plt.show()
-
-
 def device_get_model(model):
     state = nnx.state(model)
     state = jax.device_get(state)
     nnx.update(model, state)
-
     return model
 
 
@@ -757,9 +655,6 @@ def sample_image_batch(step, model):
     del pred_model
 
     return gridfile
-
-
-import pickle
 
 
 # save model params in pickle file
@@ -792,7 +687,7 @@ def load_paramdict_pickle(model, filename="ditmodel.pkl"):
     return model, params
 
 
-# replicate model
+# replicate model across devices
 state = nnx.state((rf_engine, optimizer))
 state = jax.device_put(state, model_sharding)
 nnx.update((rf_engine, optimizer), state)
@@ -810,14 +705,7 @@ def train_step(model, optimizer, batch):
 
         bs, height, width, channels = img_latents.shape
 
-        mask = random_mask(
-            bs,
-            height,
-            width,
-            patch_size=config.patch_size,
-            mask_ratio=config.mask_ratio,
-        )
-        loss = model(img_latents, label, mask)
+        loss = model(img_latents, label)
         return loss
 
     gradfn = nnx.value_and_grad(loss_func)
@@ -834,8 +722,8 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     model.train()
 
     wandb_logger(
-        key="3aef5402e364c9da47508adf8be0664512ed30b2",
-        project_name="microdit",
+        key="",
+        project_name="tiny_dit",
     )
 
     stime = time.time()
@@ -860,7 +748,7 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
             gc.collect()
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
-        path = f"microdit_imagenet_{epoch}_{train_loss}.pkl"
+        path = f"dit_imagenet_{epoch}_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
         
         epoch_file = sample_image_batch(step, model)
@@ -871,7 +759,7 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     print(f"training time for {epochs} epochs -> {etime}s / {etime/60} mins")
 
     save_paramdict_pickle(
-        model, f"microdit_in1k_{len(train_loader)*epochs}_{train_loss}.pkl"
+        model, f"dit_in1k_{len(train_loader)*epochs}_{train_loss}.pkl"
     )
 
     return model
@@ -882,7 +770,7 @@ def overfit(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     model.train()
 
     wandb_logger(
-        key="3aef5402e364c9da47508adf8be0664512ed30b2", project_name="microdit_overfit"
+        key="YOUR_KEY", project_name="microdit_overfit"
     )
 
     stime = time.time()
