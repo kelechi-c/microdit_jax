@@ -30,7 +30,6 @@ from streaming.base.format.mds.encodings import Encoding, _encodings
 from streaming import StreamingDataset
 
 import warnings
-
 warnings.filterwarnings("ignore")
 
 
@@ -42,7 +41,7 @@ class config:
     lr = 2e-4
     mask_ratio = 0.75
     epochs = 30
-    data_split = 10_000
+    data_split = 20_000
     cfg_scale = 2.0
     vaescale_factor = 0.13025
     data_id = "cloneofsimo/imagenet.int8"
@@ -181,14 +180,17 @@ dataset = StreamingDataset(
 
 num_processes = jax.process_count()
 rank = jax.process_index()
+
 # dataset_sampler = DistributedSampler(dataset, shuffle=True, drop_last=True, num_replicas=num_processes, rank=rank, seed=config.seed)
 
 print(f'datasample {dataset[0]}')
 def jax_collate(batch):
     latents = jnp.stack([
-        jnp.array(item["vae_output"].reshape(4, 32, 32)) for item in batch],axis=0
+        jnp.array(item["vae_output"]) for item in batch], axis=0
     )
     labels = jnp.stack([int(item['label']) for item in batch], axis=0)
+
+    # Metadata may not always be numerical, so store as a list
 
     return {
         "vae_output": latents,
@@ -197,8 +199,8 @@ def jax_collate(batch):
 
 
 train_loader = DataLoader(
-    dataset,
-    batch_size=8,#config.batch_size,
+    dataset[:config.data_split],
+    batch_size=16,#config.batch_size,
     num_workers=0,
     drop_last=True,
     collate_fn=jax_collate,
@@ -286,8 +288,6 @@ linear_init = nnx.initializers.xavier_uniform()
 linear_bias_init = nnx.initializers.constant(1)
 
 # input patchify layer, 2D image to patches
-
-
 class PatchEmbed(nnx.Module):
     def __init__(
         self,
@@ -536,6 +536,7 @@ class CrossAttention(nnx.Module):
 class EncoderMLP(nnx.Module):
     def __init__(self, hidden_size, rngs: nnx.Rngs, dropout=0.1):
         super().__init__()
+        
         self.layernorm = nnx.LayerNorm(hidden_size, rngs=rngs)
 
         self.linear1 = nnx.Linear(
@@ -568,7 +569,13 @@ class TransformerEncoderBlock(nnx.Module):
         self.layernorm = nnx.LayerNorm(
             embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init
         )
-        self.self_attention = SelfAttention(num_heads, embed_dim, rngs=rngs)
+        self.self_attention = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=embed_dim,
+            kernel_init=xavier_init,
+            rngs=rngs,
+            decode=False,
+        )  # SelfAttention(num_heads, embed_dim, rngs=rngs)
         self.mlp_layer = EncoderMLP(embed_dim, rngs=rngs)
 
     def __call__(self, x: Array):
@@ -651,7 +658,14 @@ class DiTBlock(nnx.Module):
         self.norm_1 = nnx.LayerNorm(
             hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
         )
-        self.attention = SelfAttention(num_heads, hidden_size, rngs=rngs)
+        self.attention = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=hidden_size,
+            kernel_init=xavier_init,
+            # outer_kerner
+            rngs=rngs,
+            decode=False,
+        )  # SelfAttention(num_heads, hidden_size, rngs=rngs)
         self.norm_2 = nnx.LayerNorm(
             hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
         )
@@ -841,9 +855,13 @@ class MicroDiT(nnx.Module):
         self.label_embedder = LabelEmbedder(
             num_classes=num_classes, hidden_size=embed_dim, drop=dropout
         )
-        self.cond_attention = CrossAttention(
-            attn_heads, embed_dim, cond_embed_dim, rngs=rngs
-        )
+        self.cond_attention = nnx.MultiHeadAttention(
+            num_heads=attn_heads,
+            in_features=embed_dim,
+            kernel_init=xavier_init,
+            rngs=rngs,
+            decode=False,
+        )  # CrossAttention(attn_heads, embed_dim, cond_embed_dim, rngs=rngs)
         self.cond_mlp = SimpleMLP(embed_dim, mlp_ratio=4)
 
         # pooling layer
@@ -1095,7 +1113,7 @@ microdit = MicroDiT(
     num_layers=16,
     attn_heads=12,
     cond_embed_dim=768,
-    patchmix_layers=4,
+    patchmix_layers=6,
 )
 
 rf_engine = RectFlowWrapper(microdit)
@@ -1118,23 +1136,21 @@ def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
 
 
 def vae_decode(latent, vae=vae):
-    print(f'decoding... (latent shape = {latent.shape}) ')
+    # print(f'decoding... (latent shape = {latent.shape}) ')
     tensor_img = rearrange(latent, "b h w c -> b c h w")
     tensor_img = torch.from_numpy(np.array(tensor_img))
-    x = vae.decode(tensor_img).sample #* 0.5 + 0.5
-    # x /= config.vaescale_factor 
-    print(f'vae decoded: {x.shape}')
+    x = vae.decode(tensor_img).sample 
+
     img = VaeImageProcessor().postprocess(
         image=x.detach(), do_denormalize=[True, True]
     )[0]
-    print(f'img postproc {type(img)}')
 
     return img
 
 
 def process_img(img, id):
     img = vae_decode(img[None])
-    img.save(f'in_{id}.png')
+    
     return img
 
 
@@ -1281,8 +1297,10 @@ nnx.update((rf_engine, optimizer), state)
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
         img_latents, label = batch['vae_output'], batch['label']
+        
+        img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
         img_latents = rearrange(img_latents, "b c h w -> b h w c")
-        print(f"latents => {img_latents.shape}")
+        # print(f"latents => {img_latents.shape}")
 
         img_latents, label = jax.device_put((img_latents, label), data_sharding)
 
@@ -1296,23 +1314,25 @@ def train_step(model, optimizer, batch):
             mask_ratio=config.mask_ratio,
         )
         loss = model(img_latents, label, mask)
-        # loss = optax.squared_error(img_latents, logits).mean()
+
         return loss
 
     gradfn = nnx.value_and_grad(loss_func)
     loss, grads = gradfn(model, batch)
     optimizer.update(grads)
+    
     return loss
 
 
 def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
-    epochs = 5
+    epochs = 2
     train_loss = 0.0
+    
     model.train()
 
     wandb_logger(
         key="",
-        project_name="microdit_jax",
+        project_name="microdit",
     )
 
     stime = time.time()
@@ -1327,9 +1347,8 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
                 "loss": train_loss.item(),
                 "log_loss": math.log10(train_loss.item())
             })
-            wandb.log({"log_loss": math.log10(train_loss.item())})
 
-            if step % 50 == 0:
+            if step % 25 == 0:
                 gridfile = sample_image_batch(step, model)
                 image_log = wandb.Image(gridfile)
                 wandb.log({"image_sample": image_log})
@@ -1340,10 +1359,13 @@ def trainer(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
         print(f"epoch {epoch+1}, train loss => {train_loss}")
         path = f"microdit_imagenet_{epoch}_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
+        
+        epoch_file = sample_image_batch(step, model)
+        epoch_image_log = wandb.Image(epoch_file)
+        wandb.log({"epoch_sample": epoch_image_log})
 
     etime = time.time() - stime
-    print(f"training time for {epochs} epochs -> {etime}s / {etime/60} mins")
-    # path = f"microdit_cifar_full_{len(train_loader)*epochs}_{train_loss}.pkl"
+    print(f"training time for {epochs} epochs -> {etime:.4f}s / {etime/60:.4f} mins")
 
     save_paramdict_pickle(
         model, f"microdit_in1k_{len(train_loader)*epochs}_{train_loss}.pkl"
@@ -1382,14 +1404,28 @@ def overfit(model=rf_engine, optimizer=optimizer, train_loader=train_loader):
 
     etime = time.time() - stime
     print(f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs")
-
+        
+    epoch_file = sample_image_batch('overfit', model)
+    epoch_image_log = wandb.Image(epoch_file)
+    wandb.log({"epoch_sample": epoch_image_log})
+    
     return model, train_loss
 
 
-# trainer()
-# wandb.finish()
-# print("microdit training(imagenet) in JAX..done")
 
-model, loss = overfit()
-wandb.finish()
-print(f"microdit overfitting ended at loss {loss:.4f}")
+
+import click
+
+@click.option('-r', '--run')
+def main(run):
+    if run=='overfit':
+        model, loss = overfit()
+        wandb.finish()
+        print(f"microdit overfitting ended at loss {loss:.4f}")
+    
+    elif run=='train':
+        trainer()
+        wandb.finish()
+        print("microdit (test) training (on imagenet-1k) in JAX..done")
+        
+main()
