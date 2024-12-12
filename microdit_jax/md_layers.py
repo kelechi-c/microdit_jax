@@ -13,30 +13,46 @@ xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 linear_bias_init = nnx.initializers.constant(1)
 
+
 ## Embedding layers
+# input patchify layer, 2D image to patches
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
     def __init__(
         self,
-        rngs: nnx.Rngs=rngs,
-        patch_size = 2,
-        img_size = 32,
+        rngs=rngs,
+        patch_size: int = 2,
         in_chan: int = 4,
         embed_dim: int = 1024,
+        img_size=config.img_size,
     ):
         super().__init__()
-        self.patch_size = (patch_size, patch_size)
-        self.img_size = img_size
+        self.patch_size = patch_size
+        self.gridsize = tuple(
+            [s // p for s, p in zip((img_size, img_size), (patch_size, patch_size))]
+        )
+        self.num_patches = self.gridsize[0] * self.gridsize[1]
 
         self.conv_project = nnx.Conv(
-            in_chan, embed_dim, kernel_size=patch_size,
-           strides=patch_size, rngs=rngs,
+            in_chan,
+            embed_dim,
+            kernel_size=(patch_size, patch_size),
+            strides=patch_size,
+            use_bias=False,  # Typically, PatchEmbed doesn't use bias
+            rngs=rngs,
         )
-        
 
-    def __call__(self, img: Array) -> Array:
-        x = self.conv_project(img)
-        x = x.flatten()
+    def __call__(self, img: jnp.ndarray) -> jnp.ndarray:
+        # Project image patches with the convolution layer
+        x = self.conv_project(
+            img
+        )  # Shape: (batch_size, embed_dim, height // patch_size, width // patch_size)
+
+        # Reshape to (batch_size, num_patches, embed_dim)
+        batch_size, h, w, embed_dim = x.shape
+        x = x.reshape(
+            batch_size, -1, embed_dim
+        )  # Shape: (batch_size, num_patches, embed_dim)
 
         return x
 
@@ -140,213 +156,6 @@ class CaptionEmbedder(nnx.Module):
         x = self.linear_2(x)
 
         return x
-
-
-# #### MoE Gate
-# class MoEGate(nnx.Module):
-#     def __init__(
-#         self, embed_dim, num_experts=4, experts_per_token=2, aux_loss_alpha=0.01
-#     ):
-#         super().__init__()
-#         self.top_k = experts_per_token
-#         self.routed_experts = num_experts
-#         self.score_func = "softmax"
-#         self.alpha = aux_loss_alpha
-#         self.seq_aux = False
-
-#         # top_k selection algo
-#         self.norm_topk_prob = False
-#         self.gating_dim = embed_dim
-#         self.weight = nnx.Param(jnp.ones((4, embed_dim)))
-#         print(self.weight.shape)
-#         # self.linear_gate = nnx.Linear()
-
-#     def __call__(self, hidden_states: Array) -> Tuple:
-#         bsize, seq_len, h = hidden_states.shape
-
-#         # gating score
-#         print(f'hidden 1 : {hidden_states.shape}')
-#         hidden_states = jnp.reshape(hidden_states, (-1, h))
-#         print(f'hiddenstate: {hidden_states.shape}')
-#         logits = jnp.dot(hidden_states, self.weight.T)
-#         print(f'logits hiddenstate: {logits.shape}')
-#         scores = nnx.softmax(logits, axis=-1)
-#         print(f'scores {scores.shape}')
-
-#         topk_idx, topk_weight = jax.lax.top_k(scores, k=self.top_k)
-#         print(f'topk_weight {topk_weight.shape}')
-
-#         # normalize to sum to 1
-#         if self.top_k > 1 and self.norm_topk_prob:
-#             denominator = jnp.sum(topk_weight, axis=-1, keepdims=True) + 1e-20
-#             topk_weight = topk_weight / denominator
-
-#         # expert level computation of auxiliary loss
-#         # always compute topk based on naive greedy topk method
-
-#         if self.train and self.alpha > 0.0:
-#             scores_for_aux = scores
-#             aux_topk = self.top_k
-#             aux_loss = 0.0
-
-#             topk_idx_for_auxloss = jnp.reshape(topk_idx, (bsize, -1))
-#             if self.seq_aux:
-#                 scores_for_seq_aux = jnp.reshape(scores_for_aux, (bsize, seq_len, -1))
-#                 ce = jnp.zeros(
-#                     (bsize, self.routed_experts), device=hidden_states.device
-#                 )
-#                 ones_add = jnp.ones((bsize, seq_len * aux_topk))
-#                 ce = jnp.add.at(ce, 1, ones_add)
-#                 ce /= seq_len * aux_topk / self.routed_experts
-
-#                 aux_loss = (ce * scores_for_seq_aux.mean(axis=1)).sum(
-#                     axis=1
-#                 ).mean() * self.alpha
-
-#             else:
-#                 mask_ce = nnx.one_hot(
-#                     jnp.reshape(topk_idx_for_auxloss, (-1)),
-#                     num_classes=self.routed_experts,
-#                 )
-#                 ce = mask_ce.astype(jnp.float32).mean(0)
-#                 pi = scores_for_aux.mean()
-#                 fi = ce * self.routed_experts
-#                 aux_loss = (pi * fi).sum() * self.alpha
-
-#         else:
-#             aux_loss = None
-
-#         print(f"gate shape => {topk_weight.shape}")
-#         # print(topk_weight)
-
-#         return topk_idx, topk_weight, aux_loss
-
-# # mixture of experts MLP layer
-# class MoEMLP(nnx.Module):
-#     def __init__(self, hidden_size, intersize, pretrain_tp=2):
-#         self.hidden_size = hidden_size
-#         self.intersize = intersize
-#         self.pretrain_tp = pretrain_tp
-#         self.gate_project = nnx.Linear(
-#             self.hidden_size, self.intersize,
-#             use_bias=False, rngs=rngs,
-#             kernel_init=nnx.initializers.xavier_uniform()
-#         )
-#         self.up_project = nnx.Linear(
-#             self.hidden_size, self.intersize, use_bias=False, rngs=rngs
-#         )
-#         self.down_project = nnx.Linear(
-#             self.intersize, self.hidden_size, use_bias=False, rngs=rngs
-#         )
-
-#     def __call__(self, x_input: Array):
-#         batch_size, seq_len, _ = x_input.shape
-
-#         if self.pretrain_tp > 1:
-#             # Calculate slice width
-#             w_slice = self.intersize // self.pretrain_tp
-
-#             # Split weights into expert chunks
-#             gate_slices = jnp.split(self.gate_project.kernel, self.pretrain_tp, axis=0)
-#             up_slices = jnp.split(self.up_project.kernel, self.pretrain_tp, axis=0)
-#             down_slices = jnp.split(self.down_project.kernel, self.pretrain_tp, axis=1)
-
-#             # Compute projections for each expert
-#             gate_projs = []
-#             up_projs = []
-
-#             for k in range(self.pretrain_tp):
-#                 # Reshape input for batch matrix multiplication
-#                 x_reshaped = x_input.reshape(-1, self.hidden_size)
-
-#                 # Compute gate and up projections
-#                 gate_proj_k = jnp.dot(x_reshaped, gate_slices[k].T)
-#                 up_proj_k = jnp.dot(x_reshaped, up_slices[k].T)
-
-#                 gate_projs.append(gate_proj_k)
-#                 up_projs.append(up_proj_k)
-
-#             # Concatenate expert outputs
-#             gate_proj = jnp.concatenate(gate_projs, axis=-1)
-#             up_proj = jnp.concatenate(up_projs, axis=-1)
-
-#             # Reshape back to (batch_size, seq_len, intersize)
-#             gate_proj = gate_proj.reshape(batch_size, seq_len, -1)
-#             up_proj = up_proj.reshape(batch_size, seq_len, -1)
-
-#             # Compute intermediate states
-#             activated_gates = nnx.silu(gate_proj)  # Changed from silu to sigmoid for gating
-#             inter_states = jnp.split(activated_gates * up_proj, self.pretrain_tp, axis=-1)
-
-#             # Compute final projection
-#             down_projs = []
-#             for k in range(self.pretrain_tp):
-#                 down_proj_k = jnp.dot(
-#                     inter_states[k].reshape(-1, w_slice),
-#                     down_slices[k]
-#                 )
-#                 down_projs.append(down_proj_k)
-
-#             # Sum expert outputs and reshape
-#             down_proj = sum(down_projs)
-#             down_proj = down_proj.reshape(batch_size, seq_len, self.hidden_size)
-
-#         else:
-#             # Standard MLP path
-#             gate_output = jnp.sigmoid(self.gate_project(x_input))  # Changed from silu to sigmoid
-#             up_output = self.up_project(x_input)
-#             down_proj = self.down_project(gate_output * up_output)
-
-#         print(f"moe mlp shape => {down_proj.shape}")
-#         return down_proj
-
-
-# class SparseMoEBlock(nnx.Module):
-#     def __init__(self, embed_dim, mlp_ratio=4, num_experts=8, experts_per_token=2, train: bool=True, rngs=rngs):
-#         super().__init__()
-#         self.experts_pertoken = experts_per_token
-#         self.expert_models = [MoEMLP(hidden_size=embed_dim, intersize=mlp_ratio*embed_dim) for _ in range(num_experts)]
-#         # self.experts = nnx.Sequential(*self.expert_models)
-#         self.router_gate = MoEGate(embed_dim, num_experts)
-#         self.n_shared_experts = 2
-#         self.training = train
-
-#         if self.n_shared_experts is not None:
-#             intermediate_size = embed_dim * self.n_shared_experts
-#             self.shared_experts = MoEMLP(hidden_size=embed_dim, intersize=intermediate_size)
-
-#     def __call__(self, hidden_states: Array):
-#         identity = hidden_states
-#         og_shape = hidden_states.shape
-#         topk_idx, topk_weight, aux_loss = self.router_gate(hidden_states)
-#         y = jrand.normal(rkey, shape=og_shape) # init as random array
-
-#         hidden_states = jnp.reshape(hidden_states, (-1, hidden_states.shape[1:]))
-#         flat_topk_idx = jnp.reshape(topk_idx, shape=(-1))
-
-#         if self.train:
-#             hidden_states = jnp.repeat(hidden_states, repeats=self.experts_pertoken, axis=0)
-#             y = jnp.empty_like(hidden_states, dtype=hidden_states.dtype)
-
-#             for k, expert in enumerate(self.expert_models):
-#                 y[flat_topk_idx == k] = expert(hidden_states[flat_topk_idx == k]).astype(hidden_states.dtype) # type: ignore
-
-#             y = jnp.reshape(y, shape=(*topk_weight.shape, -1)) * jnp.expand_dims(topk_weight, axis=-1).sum(axis=1)
-#             y = jnp.reshape(y, shape=(og_shape))
-#             # TODO: Auxiliary loss add
-
-#         else:
-#             y = None
-
-#         if self.shared_experts is not None:
-#             y = y + self.shared_experts(identity) # type: ignore
-
-#         print(f"sparse moe shape =>{y.shape}")
-
-#         return y
-
-#     def moe_infer(self, x_input):
-#         pass
 
 
 ###############
