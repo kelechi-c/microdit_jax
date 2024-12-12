@@ -5,11 +5,12 @@ from .data_utils import add_masked_patches, config, remove_masked_patches
 from .attention_mlp import OutputMLP
 from .md_layers import (
     PoolMLP, SimpleMLP, TimestepEmbedder,
-    TransformerEncoderBlock, CrossAttention,
+    TransformerEncoderBlock, FinalMLP,
      PatchEmbed, CaptionEmbedder, get_2d_sincos_pos_embed,
     LabelEmbedder, TransformerBackbone
 )
 
+xavier_init = nnx.initializers.xavier_uniform()
 rngs = nnx.Rngs(config.seed)
 
 # patch mixer module
@@ -37,10 +38,9 @@ class MicroDiT(nnx.Module):
         embed_dim,
         num_layers,
         attn_heads,
-        mlp_dim,
         cond_embed_dim,
-        dropout=0.1,
-        patchmix_layers=2,
+        dropout=0.0,
+        patchmix_layers=4,
         rngs=rngs,
         num_classes=1000,
     ):
@@ -59,10 +59,14 @@ class MicroDiT(nnx.Module):
         self.label_embedder = LabelEmbedder(
             num_classes=num_classes, hidden_size=embed_dim, drop=dropout
         )
-        self.cond_attention = CrossAttention(
-            attn_heads, embed_dim, cond_embed_dim, rngs=rngs
-        )
-        self.cond_mlp = SimpleMLP(embed_dim)
+        self.cond_attention = nnx.MultiHeadAttention(
+            num_heads=attn_heads,
+            in_features=embed_dim,
+            kernel_init=xavier_init,
+            rngs=rngs,
+            decode=False,
+        )  # CrossAttention(attn_heads, embed_dim, cond_embed_dim, rngs=rngs)
+        self.cond_mlp = SimpleMLP(embed_dim, mlp_ratio=4)
 
         # pooling layer
         self.pool_mlp = PoolMLP(embed_dim)
@@ -75,15 +79,14 @@ class MicroDiT(nnx.Module):
             embed_dim,
             embed_dim,
             embed_dim,
+            embed_dim,
             num_layers=num_layers,
             num_heads=attn_heads,
-            mlp_dim=mlp_dim,
         )
 
-        self.final_linear = OutputMLP(embed_dim, patch_size=patch_size, out_channels=4)
+        self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
     def unpatchify(self, x: Array) -> Array:
-
         bs, num_patches, patch_dim = x.shape
         H, W = self.patch_size  # Assume square patches
         in_channels = patch_dim // (H * W)
@@ -106,12 +109,14 @@ class MicroDiT(nnx.Module):
         return reconstructed
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
-        bsize, channels, height, width = x.shape
+        bsize, height, width, channels = x.shape
         psize_h, psize_w = self.patch_size
 
         x = self.patch_embedder(x)
 
-        pos_embed = get_2d_sincos_pos_embed(self.embed_dim, height // psize_h)
+        pos_embed = get_2d_sincos_pos_embed(
+            self.embed_dim, height // psize_h, width // psize_w
+        )
 
         pos_embed = jnp.expand_dims(pos_embed, axis=0)
         pos_embed = jnp.broadcast_to(
@@ -120,7 +125,6 @@ class MicroDiT(nnx.Module):
         pos_embed = jnp.reshape(
             pos_embed, shape=(bsize, self.num_patches, self.embed_dim)
         )
-        x = jnp.reshape(x, shape=(bsize, self.num_patches, self.embed_dim))
 
         x = x + pos_embed
 
@@ -130,9 +134,8 @@ class MicroDiT(nnx.Module):
 
         time_embed = self.time_embedder(t)
         time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=1)
-        # print(f'time and cond embed sape: {time_embed.shape}/{time_embed_unsqueeze.shape}, {cond_embed.shape}/{cond_embed_unsqueeze.shape}')
 
-        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed_unsqueeze)  #
+        mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed_unsqueeze)
         mha_out = mha_out.squeeze(1)
 
         mlp_out = self.cond_mlp(mha_out)
@@ -151,7 +154,7 @@ class MicroDiT(nnx.Module):
         if mask is not None:
             x = remove_masked_patches(x, mask)
 
-        mlp_out_us = jnp.expand_dims(mlp_out, axis=1)  # unqueezed mlp output
+        mlp_out_us = jnp.expand_dims(mlp_out, axis=1)
 
         cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
 
@@ -169,7 +172,7 @@ class MicroDiT(nnx.Module):
 
         return x
 
-    def sample(self, z_latent, cond, sample_steps=50, cfg=2.0):
+    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=2.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
 
@@ -178,19 +181,16 @@ class MicroDiT(nnx.Module):
 
         images = [z_latent]
 
-        for i in range(sample_steps, 0, -1):
-            t = i / sample_steps
-            t = (
-                jnp.array([t] * b_size)
-                .astype(z_latent.dtype)
-            )
+        for step in tqdm(range(sample_steps, 0, -1)):
+            t = step / sample_steps
+            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.float16)
 
-            vc = self(z_latent, t, cond, None)
+            vcond = self(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
-            vu = self.__call__(z_latent, t, null_cond)
-            vc = vu + cfg * (vc - vu)
+            v_uncond = self(z_latent, t, null_cond)
+            vcond = v_uncond + cfg * (vcond - v_uncond)
 
-            z_latent = z_latent - dt * vc
+            z_latent = z_latent - dt * vcond
             images.append(z_latent)
 
-        return images  # [-1]# / config.vaescale_factor
+        return images[-1]
