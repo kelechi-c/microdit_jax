@@ -74,20 +74,6 @@ def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
     return out
 
 
-# embeds a flat vector
-class VectorEmbedder(nnx.Module):
-    def __init__(self, input_dim, hidden_size, rngs=rngs):
-        super().__init__()
-        self.linear_1 = nnx.Linear(input_dim, hidden_size, rngs=rngs)
-        self.linear_2 = nnx.Linear(hidden_size, hidden_size, rngs=rngs)
-
-    def __call__(self, x: Array):
-        x = nnx.silu(self.linear_1(x))
-        x = self.linear_2(x)
-
-        return x
-
-
 class TimestepEmbedder(nnx.Module):
     def __init__(self, hidden_size, freq_embed_size=256):
         super().__init__()
@@ -162,41 +148,48 @@ class CaptionEmbedder(nnx.Module):
 # DiT blocks_ #
 ###############
 class DiTBlock(nnx.Module):
-    def __init__(self, hidden_size=1024, num_heads=6, mlp_ratio=4):
+    def __init__(self, hidden_size=768, num_heads=12, mlp_ratio=4):
         super().__init__()
 
         # initializations
+        linear_init = nnx.initializers.xavier_uniform()
         lnbias_init = nnx.initializers.constant(1)
         lnweight_init = nnx.initializers.constant(1)
 
         self.norm_1 = nnx.LayerNorm(
             hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
         )
-        self.attention = SelfAttention(num_heads, hidden_size, rngs=rngs)
-        self.norm_2 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs, scale_init=lnweight_init)
+        self.attention = nnx.MultiHeadAttention(
+            num_heads=num_heads,
+            in_features=hidden_size,
+            kernel_init=xavier_init,
+            rngs=rngs,
+            decode=False,
+        )  # SelfAttention(num_heads, hidden_size, rngs=rngs)
+        self.norm_2 = nnx.LayerNorm(
+            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
+        )
 
         self.adaln_linear = nnx.Linear(
             in_features=hidden_size,
-            out_features=6*hidden_size,
+            out_features=6 * hidden_size,
             use_bias=True,
             bias_init=zero_init,
             rngs=rngs,
-            # kernel_init=zero_init,
+            kernel_init=zero_init,
         )
 
-        self.mlp_block = SimpleMLP(hidden_size)
+        self.mlp_block = SimpleMLP(hidden_size, mlp_ratio)
 
     def __call__(self, x_img: Array, cond):
 
         cond = self.adaln_linear(nnx.silu(cond))
 
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            jnp.array_split(cond, 6, axis=1)
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
+            cond, 6, axis=1
         )
 
-        attn_mod_x = self.attention(
-            modulate(self.norm_1(x_img), shift_msa, scale_msa)
-        )
+        attn_mod_x = self.attention(modulate(self.norm_1(x_img), shift_msa, scale_msa))
 
         x = x_img + jnp.expand_dims(gate_msa, 1) * attn_mod_x
         x = modulate(self.norm_2(x), shift_mlp, scale_mlp)
@@ -215,16 +208,17 @@ class FinalMLP(nnx.Module):
         self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
         self.linear = nnx.Linear(
             hidden_size,
-            patch_size * patch_size * out_channels,
+            patch_size[0] * patch_size[1] * out_channels,
             rngs=rngs,
-            kernel_init=linear_init,
+            kernel_init=nnx.initializers.xavier_uniform(),
             bias_init=linear_init,
         )
+
         self.adaln_linear = nnx.Linear(
             hidden_size,
             2 * hidden_size,
             rngs=rngs,
-            kernel_init=linear_init,
+            kernel_init=nnx.initializers.xavier_uniform(),
             bias_init=linear_init,
         )
 
@@ -234,8 +228,8 @@ class FinalMLP(nnx.Module):
 
         x = modulate(self.norm_final(x_input), shift, scale)
         x = self.linear(x)
-        print(f"final dit mlp {type(x)} {x.shape}")
-        return
+
+        return x
 
 
 class DiTBackbone(nnx.Module):
