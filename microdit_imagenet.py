@@ -197,41 +197,9 @@ def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
     return out
 
 
-# Adapted from https://github.com/facebookresearch/mae/blob/main/util/pos_embed.py
-def get_2d_sincos_pos_embed(embed_dim, h, w):
-    """
-    :param embed_dim: dimension of the embedding
-    :param h: height of the grid
-    :param w: width of the grid
-    :return: [h*w, embed_dim] or [1+h*w, embed_dim] (w/ or w/o cls_token)
-    """
-    grid_h = jnp.arange(h, dtype=jnp.float32)
-    grid_w = jnp.arange(w, dtype=jnp.float32)
-    grid = jnp.meshgrid(grid_h, grid_w, indexing="ij")
-    grid = jnp.stack(grid, axis=0)
 
-    grid = jnp.reshape(grid, shape=(2, 1, h, w))
-    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
-    return pos_embed
-
-
-def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
-    assert embed_dim % 2 == 0
-
-    # use half of dimensions to encode grid_h
-    emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
-    emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
-
-    emb = jnp.concat([emb_h, emb_w], axis=1)  # (H*W, D)
-    return emb
-
-
+# From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
-    """
-    embed_dim: output dimension for each position
-    pos: a list of positions to be encoded: size (M,)
-    out: (M, D)
-    """
     assert embed_dim % 2 == 0
     omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
     omega /= embed_dim / 2.0
@@ -243,8 +211,39 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     emb_sin = jnp.sin(out)  # (M, D/2)
     emb_cos = jnp.cos(out)  # (M, D/2)
 
-    emb = jnp.concat([emb_sin, emb_cos], axis=1)  # (M, D)
+    emb = jnp.concatenate([emb_sin, emb_cos], axis=1)  # (M, D)
     return emb
+
+
+def get_1d_sincos_pos_embed(embed_dim, length):
+    return jnp.expand_dims(
+        get_1d_sincos_pos_embed_from_grid(
+            embed_dim, jnp.arange(length, dtype=jnp.float32)
+        ),
+        axis=0,
+    )
+
+
+def get_2d_sincos_pos_embed(embed_dim, length):
+    # example: embed_dim = 256, length = 16*16
+    grid_size = int(length**0.5)
+    assert grid_size * grid_size == length
+
+    def get_2d_sincos_pos_embed_from_grid(embed_dim, grid):
+        assert embed_dim % 2 == 0
+        # use half of dimensions to encode grid_h
+        emb_h = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[0])  # (H*W, D/2)
+        emb_w = get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid[1])  # (H*W, D/2)
+        emb = jnp.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
+        return emb
+
+    grid_h = jnp.arange(grid_size, dtype=jnp.float32)
+    grid_w = jnp.arange(grid_size, dtype=jnp.float32)
+    grid = jnp.meshgrid(grid_w, grid_h)  # here w goes first
+    grid = jnp.stack(grid, axis=0)
+    grid = grid.reshape([2, 1, grid_size, grid_size])
+    pos_embed = get_2d_sincos_pos_embed_from_grid(embed_dim, grid)
+    return jnp.expand_dims(pos_embed, 0)  # (1, H*W, D)
 
 
 xavier_init = nnx.initializers.xavier_uniform()
@@ -254,41 +253,31 @@ linear_init = nnx.initializers.xavier_uniform()
 linear_bias_init = nnx.initializers.constant(1)
 
 # input patchify layer, 2D image to patches
-class PatchEmbed(nnx.Module):
+class PatchEmbed:
     def __init__(
-        self,
-        rngs=rngs,
-        patch_size: int = 2,
-        in_chan: int = 4,
-        embed_dim: int = 768,
-        img_size=config.img_size,
+        self, in_channels=4, img_size: int = 32, dim=1024, patch_size: int = 2
     ):
-        super().__init__()
+        self.dim = dim
         self.patch_size = patch_size
-        self.gridsize = tuple(
-            [s // p for s, p in zip((img_size, img_size), (patch_size, patch_size))]
-        )
-        self.num_patches = self.gridsize[0] * self.gridsize[1]
-
+        patch_tuple = (patch_size, patch_size)
+        self.num_patches = (img_size // self.patch_size) ** 2
         self.conv_project = nnx.Conv(
-            in_chan,
-            embed_dim,
-            kernel_size=(patch_size, patch_size),
-            strides=patch_size,
-            use_bias=False,  # Typically, PatchEmbed doesn't use bias
+            in_channels,
+            dim,
+            kernel_size=patch_tuple,
+            strides=patch_tuple,
+            use_bias=False,
+            padding="VALID",
+            kernel_init=xavier_init,
             rngs=rngs,
         )
 
-    def __call__(self, img: jnp.ndarray) -> jnp.ndarray:
-        # Project image patches with the convolution layer
-        x = self.conv_project(img)  # Shape: (batch_size, embed_dim, height // patch_size, width // patch_size)
-
-        # Reshape to (batch_size, num_patches, embed_dim)
-        batch_size, h, w, embed_dim = x.shape
-        x = x.reshape(batch_size, -1, embed_dim)  # Shape: (batch_size, num_patches, embed_dim)
-
+    def __call__(self, x):
+        B, H, W, C = x.shape
+        num_patches_side = H // self.patch_size
+        x = self.conv_project(x)  # (B, P, P, hidden_size)
+        x = rearrange(x, "b h w c -> b (h w) c", h=num_patches_side, w=num_patches_side)
         return x
-
 
 class TimestepEmbedder(nnx.Module):
     def __init__(self, hidden_size, freq_embed_size=256):
@@ -324,7 +313,7 @@ class LabelEmbedder(nnx.Module):
         super().__init__()
         use_cfg_embeddings = drop > 0
         self.embedding_table = nnx.Embed(
-            num_classes + use_cfg_embeddings,
+            num_classes + int(use_cfg_embeddings),
             hidden_size,
             rngs=rngs,
             embedding_init=nnx.initializers.normal(0.02),
@@ -342,7 +331,7 @@ class LabelEmbedder(nnx.Module):
 
         return labels
 
-    def __call__(self, labels, train: bool, force_drop_ids=None) -> Array:
+    def __call__(self, labels, train: bool = True, force_drop_ids=None) -> Array:
         use_drop = self.dropout > 0
         if (train and use_drop) or (force_drop_ids is not None):
             labels = self.token_drop(labels, force_drop_ids)
@@ -720,7 +709,7 @@ class MicroDiT(nnx.Module):
         )  # Reshape to (bs, height, width, in_channels)
 
         return reconstructed
-
+ 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask=None):
         bsize, height, width, channels = x.shape
         psize_h, psize_w = self.patch_size
@@ -897,7 +886,7 @@ class RectFlowWrapper(nnx.Module):
             z_latent = z_latent - dt * vcond
             images.append(z_latent)
 
-        return images[-1]
+        return images[-1] / config.vaescale_factor
 
 
 microdit = MicroDiT(
@@ -1199,8 +1188,6 @@ def overfit(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     wandb.log({"epoch_sample": epoch_image_log})
     
     return model, train_loss
-
-
 
 
 import click
