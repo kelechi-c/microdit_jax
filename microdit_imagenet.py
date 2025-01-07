@@ -75,53 +75,153 @@ rep_sharding = NS(mesh, PS())
 vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
 print("loaded vae")
 
+import numpy as np
 
-def random_mask(bs, height, width, patch_size, mask_ratio):
+def apply_mask_to_tensor(x: Array, mask: Array, patch_size: tuple[int, int]) -> Array:
+    """
+    Applies a mask to a tensor. Turns the masked values to 0s.
+
+    Args:
+        x (np.ndarray): Tensor of shape (bs, c, h, w)
+        mask (np.ndarray): Tensor of shape (bs, num_patches)
+        patch_size (tuple[int, int]): Size of each patch (height, width).
+
+    Returns:
+        jax.Array: Tensor of shape (bs, c, h, w) with the masked values turned to 0s.
+    """
+import jax.numpy as jnp
+from jax import random
+
+def apply_mask_to_tensor_jax(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> jnp.ndarray:
+    """
+    Applies a mask to a tensor. Turns the masked values to 0s.
+
+    Args:
+        x (jnp.ndarray): Tensor of shape (bs, c, h, w)
+        mask (jnp.ndarray): Tensor of shape (bs, num_patches)
+        patch_size (tuple[int, int]): Size of each patch.
+
+    Returns:
+        jnp.ndarray: Tensor of shape (bs, c, h, w) with the masked values turned to 0s.
+    """
+    bs, c, h, w = x.shape
+    num_patches_h = h // patch_size[0]
+    num_patches_w = w // patch_size[1]
+
+    # Ensure that height and width are divisible by patch_size
+    assert (
+        h % patch_size[0] == 0 and w % patch_size[1] == 0
+    ), "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(
+        h, w, patch_size
+    )
+
+    # Reshape mask to (bs, num_patches_h, num_patches_w)
+    mask = mask.reshape(bs, num_patches_h, num_patches_w)
+
+    # Expand the mask to cover each patch
+    # (bs, num_patches_h, num_patches_w) -> (bs, 1, h, w)
+    mask = jnp.expand_dims(mask, axis=1)  # Add channel dimension
+
+    # Repeat for patch_size
+    mask = jnp.repeat(mask, patch_size[0], axis=2)
+    mask = jnp.repeat(mask, patch_size[1], axis=3)
+
+    # Reshape to (bs, 1, h, w) - not strictly necessary after the repeats if dims are correct
+    # mask = mask.reshape(bs, 1, h, w)
+
+    # Apply the mask to the input tensor
+    x = x * mask
+
+    return x
+
+
+def random_mask(
+    bs: int, height: int, width: int, patch_size: tuple[int, int], mask_ratio: float
+) -> Array:
+    """
+    Generates a random mask for patched images. Randomly selects patches to mask.
+
+    Args:
+        bs (int): Batch size.
+        height (int): Height of the image.
+        width (int): Width of the image.
+        patch_size (tuple of int): Size of the patches.
+        mask_ratio (float): Ratio of patches to mask. Ranges from 0 to 1. mask_ratio * 100 = percentage of 1s in the mask
+
+    Returns:
+        mask (Array): A tensor of shape (bs, num_patches) with values in {0, 1}.
+    """
     num_patches = (height // patch_size[0]) * (width // patch_size[1])
     num_patches_to_mask = int(num_patches * mask_ratio)
 
-    rand_array = jrand.normal(randkey, shape=(bs, num_patches))
-    indices = jnp.argsort(rand_array, axis=1)
+    # Create a tensor of random values
+    rand_tensor = random.uniform(randkey, (bs, num_patches))
 
-    mask = jnp.ones(shape=(bs, num_patches))
+    # Sort the random tensor and get the indices
+    indices = jnp.argsort(rand_tensor, axis=1)
 
-    batch_mask_array = jnp.expand_dims(jnp.arange(bs), axis=1)
-    # mask[batch_mask_array, indices[:, :num_patches_to_mask]] = 0
-    new_mask = mask.at[batch_mask_array, indices[:, :num_patches_to_mask]].set(0)
-    mask = new_mask
-    mask = jnp.reshape(mask, shape=(bs, num_patches))
+    # Create a mask tensor initialized with ones
+    mask = jnp.ones((bs, num_patches), dtype=jnp.int32)
+
+    # Set the first num_patches_to_mask indices to 0 for each batch
+    row_indices = jnp.arange(bs)[:, None]
+    col_indices = indices[:, :num_patches_to_mask]
+
+    # Use jax.numpy.where to conditionally set elements to 0
+    mask = mask.at[row_indices, col_indices].set(0)
 
     return mask
 
-
-def remove_masked_patches(patches: Array, mask: Array):
-    # Convert and invert mask
+def remove_masked_patches(patches: Array, mask: Array) -> Array:
+    """
+    Removes the masked patches from the patches tensor while preserving batch dimensions.
+    Returned tensor will have shape (bs, number_of_unmasked_patches, embed_dim).
+    """
+    mask = mask.astype(bool)
     mask = jnp.logical_not(mask)
+
+    # Get batch size and embed dimension
     bs, num_patches, embed_dim = patches.shape
 
-    # Method 1: Using take with nonzero
-    # Reshape mask to 2D (combining batch and patches)
-    mask_flat = mask.reshape(-1)
-    indices = jnp.nonzero(mask_flat, size=mask.shape[1])[0]
+    # Use boolean indexing to select unmasked patches for each batch
+    unmasked_patches_list = []
+    for i in range(bs):
+        unmasked_patches_list.append(patches[i][mask[i]])
 
-    patches_flat = patches.reshape(-1, embed_dim)
+    # Find the maximum number of unmasked patches across all batches
+    max_unmasked_patches = max(map(len, unmasked_patches_list))
 
-    unmasked_patches = jnp.take(patches_flat, indices, axis=0)
+    # Pad the unmasked patches with zeros to have a consistent shape
+    padded_unmasked_patches = []
+    for unmasked in unmasked_patches_list:
+        pad_width = max_unmasked_patches - unmasked.shape[0]
+        padding = [(0, pad_width), (0, 0)]  # Pad along the num_patches dimension
+        padded_unmasked_patches.append(jnp.pad(unmasked, padding))
 
-    return unmasked_patches.reshape(bs, -1, embed_dim)
+    # Stack the padded unmasked patches
+    unmasked_patches = jnp.stack(padded_unmasked_patches)
+
+    return unmasked_patches
 
 
-def add_masked_patches(patches: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
-    # Ensure mask is a boolean tensor
-    mask = mask.astype(jnp.bool_)
+def add_masked_patches_numpy(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Adds the masked patches to the patches tensor.
+    Returned tensor will have shape (bs, num_patches, embed_dim).
+    The missing patches will be filled with 0s.
+    """
+   # Ensure mask is a boolean array
+    mask = mask.astype(bool)
 
+    # Get the total number of patches and embed dimension
     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
 
+    # Create a tensor of zeros with the same shape and dtype as the patches tensor
     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
 
-    reshaped_patches = patches.reshape(-1, embed_dim)
-
-    full_patches = jnp.where(mask[..., None], reshaped_patches, full_patches)
+    # Iterate over each batch and place unmasked patches back in their original positions
+    for i in range(bs):
+        full_patches = full_patches.at[i, mask[i]].set(patches[i])
 
     return full_patches
 
@@ -748,33 +848,6 @@ class MicroDiT(nnx.Module):
             images.append(z_latent)
 
         return images[-1]
-
-
-def apply_mask(x, mask, patch_size):
-    bs, h, w, c = x.shape
-    num_patches_h, num_patches_w = h // patch_size[0], w // patch_size[1]
-
-    # Ensure that height and width are divisible by patch_size
-    assert (
-        h % patch_size[0] == 0 and w % patch_size[1] == 0
-    ), "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(
-        h, w, patch_size
-    )
-
-    # Reshape mask to (bs, num_patches_h, num_patches_w)
-    mask = mask.reshape((bs, num_patches_h, num_patches_w))
-    # print(f"x in => {x.shape}, mask => {mask.shape}")
-
-    # Expand the mask to cover each patch
-    # (bs, num_patches_h, num_patches_w) -> (bs, h, w, 1)
-    mask = jnp.expand_dims(mask, axis=3)  # Add channel dimension
-    mask = jnp.repeat(mask, patch_size[0], axis=1)  # Repeat for patch_size height
-    mask = jnp.repeat(mask, patch_size[1], axis=2)  # Repeat for patch_size width
-
-    # Apply the mask to the input tensor
-    x = x * mask
-
-    return x
 
 
 # rectifed flow forward pass, loss, and smapling
