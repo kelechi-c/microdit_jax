@@ -16,7 +16,7 @@ from flax.core import freeze, unfreeze
 from einops import rearrange
 
 import os, wandb, time, pickle, gc, click
-import math, flax, torch
+import math, flax, torch, streaming
 from tqdm.auto import tqdm
 from typing import List, Any
 from torch.utils.data import DataLoader
@@ -223,16 +223,6 @@ _encodings["uint8"] = uint8
 remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
 local_train_dir = "./imagenet" # just a local mirror path 
 
-dataset = StreamingDataset(
-    local=local_train_dir,
-    remote=remote_train_dir,
-    split=None,
-    shuffle=True,
-    shuffle_algo="naive",
-    batch_size=config.batch_size,
-)
-
-
 def jax_collate(batch):
     latents = jnp.stack([jnp.array(item["vae_output"]) for item in batch], axis=0)
     labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
@@ -247,16 +237,6 @@ def jax_collate(batch):
 # modulation with shift and scale
 def modulate(x, shift, scale):
     return x * (1 + scale[:, None]) + shift[:, None]
-
-
-# # equivalnet of F.linear
-# def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
-#     out = jnp.dot(array, weight)
-
-#     if bias is not None:
-#         out += bias
-
-#     return out
 
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -1118,6 +1098,15 @@ def overfit(epochs, model, optimizer, train_loader):
 @click.option('-e', '--epochs', default=30)
 def main(run, epochs):
     
+    dataset = StreamingDataset(
+        local=local_train_dir,
+        remote=remote_train_dir,
+        split=None,
+        shuffle=True,
+        shuffle_algo="naive",
+        batch_size=config.batch_size,
+    )
+    streaming.base.util.clean_stale_shared_memory()
     
     train_loader = DataLoader(
         dataset[:config.data_split],
