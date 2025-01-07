@@ -2,7 +2,7 @@
 Training a MicroDIT model, ~300M params, 24-depth, 12 heads config for on Imagenet
 """
 
-import jax
+import jax, optax
 from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
@@ -15,7 +15,7 @@ from flax.serialization import to_state_dict, from_state_dict
 from flax.core import freeze, unfreeze
 from einops import rearrange
 
-import os, wandb, time, pickle, gc
+import os, wandb, time, pickle, gc, click
 import math, flax, torch
 from tqdm.auto import tqdm
 from typing import List, Any
@@ -75,24 +75,8 @@ rep_sharding = NS(mesh, PS())
 vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
 print("loaded vae")
 
-import numpy as np
 
-def apply_mask_to_tensor(x: Array, mask: Array, patch_size: tuple[int, int]) -> Array:
-    """
-    Applies a mask to a tensor. Turns the masked values to 0s.
-
-    Args:
-        x (np.ndarray): Tensor of shape (bs, c, h, w)
-        mask (np.ndarray): Tensor of shape (bs, num_patches)
-        patch_size (tuple[int, int]): Size of each patch (height, width).
-
-    Returns:
-        jax.Array: Tensor of shape (bs, c, h, w) with the masked values turned to 0s.
-    """
-import jax.numpy as jnp
-from jax import random
-
-def apply_mask_to_tensor_jax(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> jnp.ndarray:
+def apply_mask(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> Array:
     """
     Applies a mask to a tensor. Turns the masked values to 0s.
 
@@ -204,7 +188,7 @@ def remove_masked_patches(patches: Array, mask: Array) -> Array:
     return unmasked_patches
 
 
-def add_masked_patches_numpy(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def add_masked_patches(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
     Adds the masked patches to the patches tensor.
     Returned tensor will have shape (bs, num_patches, embed_dim).
@@ -856,16 +840,13 @@ class RectFlowWrapper(nnx.Module):
         self.model = model
         self.sigln = sigln
 
-    def __call__(self, x_input: Array, cond: Array, mask) -> Array:
+    def __call__(self, x_input: Array, cond: Array, mask):
         b_size = x_input.shape[0]  # batch_size
         rand_t = None
 
-        if self.sigln:
-            rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
-            rand_t = nnx.sigmoid(rand)
-        else:
-            rand_t = jrand.uniform(randkey, (b_size,))
-
+        rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
+        rand_t = nnx.sigmoid(rand)
+    
         inshape = [1] * len(x_input.shape[1:])
         texp = rand_t.reshape([b_size, *(inshape)]).astype(jnp.bfloat16)
 
@@ -887,10 +868,11 @@ class RectFlowWrapper(nnx.Module):
 
         loss = jnp.mean(batchwise_mse_loss)
         loss = loss * 1 / (1 - config.mask_ratio)
-        return loss
+        
+        return v_thetha, loss
     
 
-    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=2.0):
+    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=3.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
 
@@ -905,32 +887,13 @@ class RectFlowWrapper(nnx.Module):
 
             vcond = self.model(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
-            v_uncond = self.model(z_latent, t, null_cond)
+            v_uncond = self.model(z_latent, t, null_cond) # type: ignore
             vcond = v_uncond + cfg * (vcond - v_uncond)
 
             z_latent = z_latent - dt * vcond
             images.append(z_latent)
 
         return images[-1] / config.vaescale_factor
-
-
-microdit = MicroDiT(
-    inchannels=4,
-    patch_size=(2, 2),
-    embed_dim=768,
-    num_layers=24,
-    attn_heads=12,
-    cond_embed_dim=768,
-    patchmix_layers=4,
-)
-
-rf_engine = RectFlowWrapper(microdit)
-graph, state = nnx.split(rf_engine)
-
-n_params = sum([p.size for p in jax.tree.leaves(state)])
-print(f"model parameters count: {n_params/1e6:.2f}M")
-
-optimizer = nnx.Optimizer(rf_engine, optax.adamw(learning_rate=config.lr))
 
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
@@ -942,11 +905,32 @@ def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
         settings=wandb.Settings(init_timeout=120),
     )
 
+def device_get_model(model):
+    state = nnx.state(model)
+    state = jax.device_get(state)
+    nnx.update(model, state)
+
+    return model
+
+
+def sample_image_batch(step, model, labels):
+    pred_model = device_get_model(model)
+    pred_model.eval()
+    image_batch = pred_model.sample(labels)
+    file = f"mdsamples/{step}_microdit.png"
+    batch = [process_img(x) for x in image_batch]
+
+    gridfile = image_grid(batch, file)
+    print(f"sample saved @ {gridfile}")
+    del pred_model
+
+    return gridfile
+
 
 def vae_decode(latent, vae=vae):
     tensor_img = rearrange(latent, "b h w c -> b c h w")
     tensor_img = torch.from_numpy(np.array(tensor_img))
-    x = vae.decode(tensor_img).sample 
+    x = vae.decode(tensor_img).sample
 
     img = VaeImageProcessor().postprocess(
         image=x.detach(), do_denormalize=[True, True]
@@ -955,9 +939,8 @@ def vae_decode(latent, vae=vae):
     return img
 
 
-def process_img(img, id):
+def process_img(img):
     img = vae_decode(img[None])
-    
     return img
 
 
@@ -980,89 +963,8 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     plt.tight_layout()
     plt.savefig(file, bbox_inches="tight")
     plt.show()
-    
+
     return file
-
-
-def save_image_grid(batch, file_path: str, grid_size=None):
-    # batch = process_img(batch)
-    # Determine grid size
-    batch_size = batch.shape[0]
-    if grid_size is None:
-        grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
-        rows, cols = grid_size, grid_size
-    else:
-        rows, cols = grid_size
-
-    # Set up the grid
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3, rows * 3))
-
-    # Plot each image
-    for i, ax in enumerate(axes.flat):
-        if i < batch_size:
-            image = process_img(batch[i])
-            # image = np.clip(image, 0, 1)
-            # img = (image * 255).astype(np.uint8)  # Scale image to 0-255
-            ax.imshow(np.array(image))
-            ax.axis("off")
-        else:
-            ax.axis("off")  # Hide unused subplots
-
-    plt.tight_layout()
-    plt.savefig(file_path, bbox_inches="tight")
-    plt.close(fig)
-
-    return file_path
-
-
-def display_samples(sample_batch):
-    batch = np.array(sample_batch)
-    # Set up the grid
-    batch_size = batch.shape[0]
-
-    grid_size = int(np.ceil(np.sqrt(batch_size)))  # Square grid
-
-    fig, axes = plt.subplots(grid_size, grid_size, figsize=(10, 10))
-
-    # Plot each image
-    for i, ax in enumerate(axes.flat):
-        if i < batch_size:
-            img = process_img(batch[i])
-            ax.imshow(img)
-            ax.axis("off")
-        else:
-            ax.axis("off")  # Hide unused subplots
-
-    plt.tight_layout()
-    plt.show()
-
-
-def device_get_model(model):
-    state = nnx.state(model)
-    state = jax.device_get(state)
-    nnx.update(model, state)
-
-    return model
-
-
-def sample_image_batch(step, model):
-    classin = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])  # 76, 292, 293, 979, 968 imagenet
-    randnoise = jrand.uniform(
-        randkey, (len(classin), config.img_size, config.img_size, 4)
-    )
-    pred_model = device_get_model(model)
-    pred_model.eval()
-    image_batch = pred_model.sample(randnoise, classin)
-    file = f"samples/imagenet_dit_output@{step}.png"
-    batch = [process_img(x, id) for id, x in enumerate(image_batch)]
-    gridfile = image_grid(batch, file)
-    print(f'sample saved @ {gridfile}')
-    del pred_model
-
-    return gridfile
-
-
-import pickle
 
 
 # save model params in pickle file
@@ -1094,12 +996,6 @@ def load_paramdict_pickle(model, filename="ditmodel.pkl"):
     return model, params
 
 
-# replicate model
-state = nnx.state((rf_engine, optimizer))
-state = jax.device_put(state, model_sharding)
-nnx.update((rf_engine, optimizer), state)
-
-
 @nnx.jit
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
@@ -1120,7 +1016,7 @@ def train_step(model, optimizer, batch):
             patch_size=config.patch_size,
             mask_ratio=config.mask_ratio,
         )
-        loss = model(img_latents, label, mask)
+        v_thetha, loss = model(img_latents, label, mask)
 
         return loss
 
@@ -1131,19 +1027,20 @@ def train_step(model, optimizer, batch):
     return loss
 
 
-def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loader):
+def trainer(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     
     model.train()
 
-    wandb_logger(
-        key="",
-        project_name="microdit",
-    )
+    # wandb_logger(
+    #     key="",
+    #     project_name="microdit",
+    # )
 
     stime = time.time()
+    sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
 
-    for epoch in tqdm(range(epochs)):
+    for epoch in tqdm(range(epochs), desc='Training..../'):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss = train_step(model, optimizer, batch)
@@ -1154,8 +1051,8 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
                 "log_loss": math.log10(train_loss.item())
             })
 
-            if step % 25 == 0:
-                gridfile = sample_image_batch(step, model)
+            if step % 1000 == 0:
+                gridfile = sample_image_batch(step, model, sample_labels)
                 image_log = wandb.Image(gridfile)
                 wandb.log({"image_sample": image_log})
 
@@ -1163,10 +1060,10 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
             gc.collect()
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
-        path = f"microdit_imagenet_{epoch}_{train_loss}.pkl"
+        path = f"{epoch}_microdit_imagenet_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
         
-        epoch_file = sample_image_batch(step, model)
+        epoch_file = sample_image_batch(step, model, sample_labels)
         epoch_image_log = wandb.Image(epoch_file)
         wandb.log({"epoch_sample": epoch_image_log})
 
@@ -1174,31 +1071,32 @@ def trainer(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     print(f"training time for {epochs} epochs -> {etime:.4f}s / {etime/60:.4f} mins")
 
     save_paramdict_pickle(
-        model, f"microdit_in1k_{len(train_loader)*epochs}_{train_loss}.pkl"
+        model, f"microdit_in1k_step-{len(train_loader)*epochs}_floss-{train_loss}.pkl"
     )
 
     return model
 
 
-def overfit(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loader):
+def overfit(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     model.train()
 
-    wandb_logger(
-        key="", project_name="microdit_overfit"
-    )
+    # wandb_logger(
+    #     key="", project_name="microdit_overfit"
+    # )
 
     stime = time.time()
 
     batch = next(iter(train_loader))
+    
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         train_loss = train_step(model, optimizer, batch)
         print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
         wandb.log({"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())})
         
-        if epoch % 25 == 0:
-            gridfile = sample_image_batch(epoch, model)
+        if epoch % 50 == 0:
+            gridfile = sample_image_batch(epoch, model, batch['labels'])
             image_log = wandb.Image(gridfile)
             wandb.log({"image_sample": image_log})
 
@@ -1208,19 +1106,18 @@ def overfit(epochs, model=rf_engine, optimizer=optimizer, train_loader=train_loa
     etime = time.time() - stime
     print(f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs")
         
-    epoch_file = sample_image_batch('overfit', model)
+    epoch_file = sample_image_batch('overfit', model, batch['labels'])
     epoch_image_log = wandb.Image(epoch_file)
     wandb.log({"epoch_sample": epoch_image_log})
     
     return model, train_loss
 
 
-import click
-
 @click.command()
 @click.option('-r', '--run', default='overfit')
-@click.option('-e', '--epochs', default=10)
+@click.option('-e', '--epochs', default=30)
 def main(run, epochs):
+    
     
     train_loader = DataLoader(
         dataset[:config.data_split],
@@ -1234,13 +1131,35 @@ def main(run, epochs):
     sp = next(iter(train_loader))
     print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, type = {type(sp['vae_output'])}")
 
+    microdit = MicroDiT(
+        in_channels=4,
+        patch_size=(2, 2),
+        embed_dim=768,
+        num_layers=12,
+        attn_heads=12,
+        patchmix_layers=4,
+    )
+
+    rf_engine = RectFlowWrapper(microdit)
+    graph, state = nnx.split(rf_engine)
+
+    n_params = sum([p.size for p in jax.tree.leaves(state)])
+    print(f"model parameters count: {n_params/1e6:.2f}M")
+
+    optimizer = nnx.Optimizer(rf_engine, optax.adamw(learning_rate=config.lr))
+
+    # replicate model across devices
+    state = nnx.state((rf_engine, optimizer))
+    state = jax.device_put(state, rep_sharding)
+    nnx.update((rf_engine, optimizer), state)
+
     if run=='overfit':
-        model, loss = overfit(epochs)
+        model, loss = overfit(epochs, rf_engine, optimizer, train_loader)
         wandb.finish()
         print(f"microdit overfitting ended at loss {loss:.4f}")
     
     elif run=='train':
-        trainer(epochs)
+        trainer(epochs, rf_engine, optimizer, train_loader)
         wandb.finish()
         print("microdit (test) training (on imagenet-1k) in JAX..done")
 
