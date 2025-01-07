@@ -727,7 +727,7 @@ class MicroDiT(nnx.Module):
         reconstructed = x.reshape((bs, height, width, in_channels))
         return reconstructed
 
-    def __call__(self, x: Array, t: Array, y_cap: Array, mask=None, train=False):
+    def __call__(self, x: Array, t: Array, y_cap: Array, mask: Array=None, train=False):
         bsize, height, width, channels = x.shape
         x = self.patch_embedder(x)
 
@@ -863,7 +863,7 @@ class RectFlowWrapper(nnx.Module):
 
         for step in tqdm(range(sample_steps, 0, -1)):
             t = step / sample_steps
-            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.float16)
+            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
 
             vcond = self.model(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
@@ -948,7 +948,7 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
 
 
 # save model params in pickle file
-def save_paramdict_pickle(model, filename="dit_model.pkl"):
+def save_paramdict_pickle(model, filename="dit_model.ckpt"):
     params = nnx.state(model)
     params = jax.device_get(params)
 
@@ -963,7 +963,7 @@ def save_paramdict_pickle(model, filename="dit_model.pkl"):
     return flat_state_dict
 
 
-def load_paramdict_pickle(model, filename="ditmodel.pkl"):
+def load_paramdict_pickle(model, filename="dit_model.ckpt"):
     with open(filename, "rb") as modelfile:
         params = pickle.load(modelfile)
 
@@ -1026,15 +1026,15 @@ def trainer(epochs, model, optimizer, train_loader):
             train_loss = train_step(model, optimizer, batch)
             print(f"step {step}, loss-> {train_loss.item():.4f}")
 
-            wandb.log({
-                "loss": train_loss.item(),
-                "log_loss": math.log10(train_loss.item())
-            })
+            # wandb.log({
+            #     "loss": train_loss.item(),
+            #     "log_loss": math.log10(train_loss.item())
+            # })
 
             if step % 1000 == 0:
                 gridfile = sample_image_batch(step, model, sample_labels)
                 image_log = wandb.Image(gridfile)
-                wandb.log({"image_sample": image_log})
+                # wandb.log({"image_sample": image_log})
 
             jax.clear_caches()
             gc.collect()
@@ -1045,7 +1045,7 @@ def trainer(epochs, model, optimizer, train_loader):
         
         epoch_file = sample_image_batch(step, model, sample_labels)
         epoch_image_log = wandb.Image(epoch_file)
-        wandb.log({"epoch_sample": epoch_image_log})
+        # wandb.log({"epoch_sample": epoch_image_log})
 
     etime = time.time() - stime
     print(f"training time for {epochs} epochs -> {etime:.4f}s / {etime/60:.4f} mins")
@@ -1073,12 +1073,12 @@ def overfit(epochs, model, optimizer, train_loader):
     for epoch in tqdm(range(epochs)):
         train_loss = train_step(model, optimizer, batch)
         print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
-        wandb.log({"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())})
+        # wandb.log({"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())})
         
         if epoch % 50 == 0:
-            gridfile = sample_image_batch(epoch, model, batch['labels'])
+            gridfile = sample_image_batch(epoch, model, batch['label'])
             image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
+            # wandb.log({"image_sample": image_log})
 
         jax.clear_caches()
         gc.collect()
@@ -1088,7 +1088,7 @@ def overfit(epochs, model, optimizer, train_loader):
         
     epoch_file = sample_image_batch('overfit', model, batch['labels'])
     epoch_image_log = wandb.Image(epoch_file)
-    wandb.log({"epoch_sample": epoch_image_log})
+    # wandb.log({"epoch_sample": epoch_image_log})
     
     return model, train_loss
 
@@ -1096,29 +1096,26 @@ def overfit(epochs, model, optimizer, train_loader):
 @click.command()
 @click.option('-r', '--run', default='overfit')
 @click.option('-e', '--epochs', default=30)
-def main(run, epochs):
+@click.option("-bs", "--batch_size", default=config.batch_size)
+def main(run, epochs, batch_size):
     
+    streaming.base.util.clean_stale_shared_memory()
     dataset = StreamingDataset(
         local=local_train_dir,
         remote=remote_train_dir,
         split=None,
-        shuffle=True,
-        shuffle_algo="naive",
         batch_size=config.batch_size,
     )
-    streaming.base.util.clean_stale_shared_memory()
-    
     train_loader = DataLoader(
-        dataset[:config.data_split],
-        batch_size=16, #config.batch_size,
+        dataset[: config.data_split],
+        batch_size=batch_size,
         num_workers=0,
         drop_last=True,
         collate_fn=jax_collate,
-        # sampler=dataset_sampler, # this is for multiprocess/v4-32
     )
 
     sp = next(iter(train_loader))
-    print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, type = {type(sp['vae_output'])}")
+    print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, labels = {sp['label']}")
 
     microdit = MicroDiT(
         in_channels=4,
