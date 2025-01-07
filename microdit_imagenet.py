@@ -4,7 +4,7 @@ Training a MicroDIT model, ~300M params, 24-depth, 12 heads config for on Imagen
 
 import jax
 from jax import Array, numpy as jnp, random as jrand
-from jax.sharding import NamedSharding, Mesh, PartitionSpec as PS
+from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
@@ -19,10 +19,8 @@ import os, wandb, time, pickle, gc
 import math, flax, torch
 from tqdm.auto import tqdm
 from typing import List, Any
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from PIL import Image as pillow
-from datasets import load_dataset
 from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from streaming.base.format.mds.encodings import Encoding, _encodings
@@ -41,11 +39,8 @@ class config:
     mask_ratio = 0.75
     epochs = 30
     data_split = 20_000 #imagenet split to train on
-    cfg_scale = 2.0
+    cfg_scale = 3.0
     vaescale_factor = 0.13025
-    data_id = "cloneofsimo/imagenet.int8"
-    vae_id = "madebyollin/sdxl-vae-fp16-fix"
-    imagenet_id = "ILSVRC/imagenet-1k"
 
 
 # XLA/JAX flags
@@ -63,14 +58,18 @@ rngs = nnx.Rngs(config.seed)
 # mesh / sharding configs
 num_devices = jax.device_count()
 devices = jax.devices()
-mesh = Mesh(mesh_utils.create_device_mesh((num_devices,)), ("data",))
-model_sharding = NamedSharding(mesh, PS())
-data_sharding = NamedSharding(mesh, PS("data"))
+num_processes = jax.process_count()
+rank = jax.process_index()
 
 
-print(f"found {num_devices} JAX devices")
+print(f"found {num_devices} JAX device(s)")
 for device in devices:
     print(f"{device} / ")
+
+mesh_devices = mesh_utils.create_device_mesh((num_devices,))
+mesh = Mesh(mesh_devices, axis_names=("data",))
+data_sharding = NS(mesh, PS("data"))
+rep_sharding = NS(mesh, PS())
 
 # sd VAE for decoding latents
 vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae")
@@ -150,17 +149,9 @@ dataset = StreamingDataset(
 )
 
 
-num_processes = jax.process_count()
-rank = jax.process_index()
-
-print(f'datasample {dataset[0]}')
-# dataset_sampler = DistributedSampler(dataset, shuffle=True, drop_last=True, num_replicas=num_processes, rank=rank, seed=config.seed)
-
 def jax_collate(batch):
-    latents = jnp.stack([
-        jnp.array(item["vae_output"]) for item in batch], axis=0
-    )
-    labels = jnp.stack([int(item['label']) for item in batch], axis=0)
+    latents = jnp.stack([jnp.array(item["vae_output"]) for item in batch], axis=0)
+    labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
 
     return {
         "vae_output": latents,
@@ -168,35 +159,20 @@ def jax_collate(batch):
     }
 
 
-train_loader = DataLoader(
-    dataset[:config.data_split],
-    batch_size=16,#config.batch_size,
-    num_workers=0,
-    drop_last=True,
-    collate_fn=jax_collate,
-    # sampler=dataset_sampler, # thi sis for multiprocess/v4-32
-)
-
-sp = next(iter(train_loader))
-print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, type = {type(sp['vae_output'])}")
-
 # model helper functions
 # modulation with shift and scale
-def modulate(x_array: Array, shift, scale) -> Array:
-    x = x_array * (1 + jnp.expand_dims(scale, 1))
-    x = x + jnp.expand_dims(shift, 1)
-    return x
-
-# equivalnet of F.linear
-def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
-    out = jnp.dot(array, weight)
-
-    if bias is not None:
-        out += bias
-
-    return out
+def modulate(x, shift, scale):
+    return x * (1 + scale[:, None]) + shift[:, None]
 
 
+# # equivalnet of F.linear
+# def linear(array: Array, weight: Array, bias: Array | None = None) -> Array:
+#     out = jnp.dot(array, weight)
+
+#     if bias is not None:
+#         out += bias
+
+#     return out
 
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -393,29 +369,29 @@ class TransformerEncoderBlock(nnx.Module):
         self.layernorm = nnx.LayerNorm(
             embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init
         )
-        self.self_attention = nnx.MultiHeadAttention(
+
+        self.self_attention =  nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=embed_dim,
-            kernel_init=xavier_init,
-            rngs=rngs,
             decode=False,
-        )  # SelfAttention(num_heads, embed_dim, rngs=rngs)
+            rngs=rngs,
+        ) # SelfAttention(num_heads, embed_dim, rngs=rngs)
         self.mlp_layer = EncoderMLP(embed_dim, rngs=rngs)
 
     def __call__(self, x: Array):
-        x = x + self.layernorm(self.self_attention(x))
-        x = x + self.layernorm(self.mlp_layer(x))
-
+        x = x + self.self_attention(self.layernorm(x))
+        x = x + self.mlp_layer(self.layernorm(x))
         return x
 
 
-class SimpleMLP(nnx.Module):
+class MLP(nnx.Module):
     def __init__(self, embed_dim, mlp_ratio):
         super().__init__()
         hidden = int(mlp_ratio * embed_dim)
-        # print(f"simple {hidden}")
-        self.linear_1 = nnx.Linear(embed_dim, hidden, rngs=rngs)
-        self.linear_2 = nnx.Linear(hidden, embed_dim, rngs=rngs)
+        self.linear_1 = nnx.Linear(embed_dim, hidden, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init)
+        self.linear_2 = nnx.Linear(
+            hidden, embed_dim, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
+        )
 
     def __call__(self, x: Array) -> Array:
         x = nnx.gelu(self.linear_1(x))
@@ -432,15 +408,15 @@ class PoolMLP(nnx.Module):
             embed_dim,
             embed_dim,
             rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init,
+            kernel_init=xavier_init,
+            bias_init=zero_init
         )
         self.linear_2 = nnx.Linear(
             embed_dim,
             embed_dim,
             rngs=rngs,
-            bias_init=linear_bias_init,
-            kernel_init=linear_init,
+            kernel_init=xavier_init,
+            bias_init=zero_init,
         )
 
     def __call__(self, x: Array) -> Array:
@@ -456,63 +432,47 @@ class PoolMLP(nnx.Module):
 # DiT blocks_ #
 ###############
 class DiTBlock(nnx.Module):
-    def __init__(self, hidden_size=768, num_heads=12, mlp_ratio=4):
+    def __init__(self, hidden_size=768, num_heads=12, mlp_ratio=4, drop: float = 0.0, rngs=rngs):
         super().__init__()
-
-        # initializations
-        linear_init = nnx.initializers.xavier_uniform()
-        lnbias_init = nnx.initializers.constant(1)
-        lnweight_init = nnx.initializers.constant(1)
-
-        self.norm_1 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
+        self.norm_1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init)
+        self.norm_2 = nnx.LayerNorm(
+            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init
         )
         self.attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=hidden_size,
-            kernel_init=xavier_init,
-            # outer_kerner
-            rngs=rngs,
             decode=False,
-        )  # SelfAttention(num_heads, hidden_size, rngs=rngs)
-        self.norm_2 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=lnbias_init
-        )
-
-        self.adaln_linear = nnx.Linear(
-            in_features=hidden_size,
-            out_features=6 * hidden_size,
-            use_bias=True,
-            bias_init=zero_init,
+            dropout_rate=drop,
             rngs=rngs,
-            kernel_init=zero_init,
+        )
+        self.adaln = nnx.Linear(
+            hidden_size, 6 * hidden_size, 
+            kernel_init=zero_init, bias_init=zero_init,
+            rngs=rngs
+        )
+        self.mlp_block = MLP(hidden_size, mlp_ratio)
+
+    def __call__(self, x_img: Array, cond: Array):
+        cond = self.adaln(nnx.silu(cond))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+            jnp.array_split(cond, 6, axis=-1)
         )
 
-        self.mlp_block = SimpleMLP(hidden_size, mlp_ratio)
+        attn_x = self.attention(modulate(self.norm_1(x_img), shift_msa, scale_msa))
+        x = x_img + (jnp.expand_dims(gate_msa, 1) * attn_x)
 
-    def __call__(self, x_img: Array, cond):
-
-        cond = self.adaln_linear(nnx.silu(cond))
-
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = jnp.split(
-            cond, 6, axis=1
-        )
-
-        attn_mod_x = self.attention(modulate(self.norm_1(x_img), shift_msa, scale_msa))
-
-        x = x_img + jnp.expand_dims(gate_msa, 1) * attn_mod_x
         x = modulate(self.norm_2(x), shift_mlp, scale_mlp)
-        mlp_mod_x = self.mlp_block(x)
-        x = x + jnp.expand_dims(gate_mlp, 1) * mlp_mod_x
+        mlp_x = self.mlp_block(x)
+        x = x + (jnp.expand_dims(gate_mlp, 1) * mlp_x)
 
         return x
 
 
 class FinalMLP(nnx.Module):
-    def __init__(self, hidden_size, patch_size, out_channels):
+    def __init__(
+        self, hidden_size, patch_size, out_channels, rngs=nnx.Rngs(config.seed)
+    ):
         super().__init__()
-        # linear_init = nnx.initializers.xavier_uniform()
-        linear_init = nnx.initializers.constant(0)
 
         self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
         self.linear = nnx.Linear(
@@ -520,20 +480,20 @@ class FinalMLP(nnx.Module):
             patch_size[0] * patch_size[1] * out_channels,
             rngs=rngs,
             kernel_init=nnx.initializers.xavier_uniform(),
-            bias_init=linear_init
+            bias_init=zero_init,
         )
-        
+
         self.adaln_linear = nnx.Linear(
             hidden_size,
             2 * hidden_size,
             rngs=rngs,
             kernel_init=nnx.initializers.xavier_uniform(),
-            bias_init=linear_init,
+            bias_init=zero_init,
         )
 
     def __call__(self, x_input: Array, cond: Array):
         linear_cond = nnx.silu(self.adaln_linear(cond))
-        shift, scale = jnp.array_split(linear_cond, 2, axis=1)
+        shift, scale = jnp.array_split(linear_cond, 2, axis=-1)
 
         x = modulate(self.norm_final(x_input), shift, scale)
         x = self.linear(x)
@@ -1196,6 +1156,19 @@ import click
 @click.option('-r', '--run', default='overfit')
 @click.option('-e', '--epochs', default=10)
 def main(run, epochs):
+    
+    train_loader = DataLoader(
+        dataset[:config.data_split],
+        batch_size=16, #config.batch_size,
+        num_workers=0,
+        drop_last=True,
+        collate_fn=jax_collate,
+        # sampler=dataset_sampler, # this is for multiprocess/v4-32
+    )
+
+    sp = next(iter(train_loader))
+    print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, type = {type(sp['vae_output'])}")
+
     if run=='overfit':
         model, loss = overfit(epochs)
         wandb.finish()
