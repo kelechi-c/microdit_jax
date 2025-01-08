@@ -6,6 +6,7 @@ import jax, optax
 from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
+
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 import numpy as np
@@ -27,6 +28,7 @@ from streaming.base.format.mds.encodings import Encoding, _encodings
 from streaming import StreamingDataset
 
 import warnings
+
 warnings.filterwarnings("ignore")
 
 
@@ -38,7 +40,7 @@ class config:
     lr = 2e-4
     mask_ratio = 0.75
     epochs = 30
-    data_split = 20_000 #imagenet split to train on
+    data_split = 20_000  # imagenet split to train on
     cfg_scale = 3.0
     vaescale_factor = 0.13025
 
@@ -88,35 +90,28 @@ def apply_mask(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -
     Returns:
         jnp.ndarray: Tensor of shape (bs, c, h, w) with the masked values turned to 0s.
     """
-    bs, c, h, w = x.shape
+    bs, h, w, c = x.shape
     num_patches_h = h // patch_size[0]
     num_patches_w = w // patch_size[1]
 
-    # Ensure that height and width are divisible by patch_size
     assert (
         h % patch_size[0] == 0 and w % patch_size[1] == 0
-    ), "Height and width must be divisible by patch_size. Height: {}, Width: {}, Patch size: {}".format(
-        h, w, patch_size
-    )
+    ), f"Height and width must be divisible by patch_size. Height: {h}, Width: {w}, Patch size: {patch_size}"
 
     # Reshape mask to (bs, num_patches_h, num_patches_w)
-    mask = mask.reshape(bs, num_patches_h, num_patches_w)
+    mask_reshaped = mask.reshape(bs, num_patches_h, num_patches_w)
+    # print(f'{mask_reshaped.shape = } / {x.shape = }')
+    # Expand the mask to cover each pixel of the patches
+    mask_expanded = jnp.repeat(
+        jnp.repeat(jnp.expand_dims(mask_reshaped, axis=-1), patch_size[0], axis=2),
+        patch_size[1],
+        axis=1,
+    )
 
-    # Expand the mask to cover each patch
-    # (bs, num_patches_h, num_patches_w) -> (bs, 1, h, w)
-    mask = jnp.expand_dims(mask, axis=1)  # Add channel dimension
+    # Apply the mask: masked regions will be multiplied by 0
+    masked_x = x * mask_expanded
 
-    # Repeat for patch_size
-    mask = jnp.repeat(mask, patch_size[0], axis=2)
-    mask = jnp.repeat(mask, patch_size[1], axis=3)
-
-    # Reshape to (bs, 1, h, w) - not strictly necessary after the repeats if dims are correct
-    # mask = mask.reshape(bs, 1, h, w)
-
-    # Apply the mask to the input tensor
-    x = x * mask
-
-    return x
+    return masked_x
 
 
 def random_mask(
@@ -139,7 +134,7 @@ def random_mask(
     num_patches_to_mask = int(num_patches * mask_ratio)
 
     # Create a tensor of random values
-    rand_tensor = random.uniform(randkey, (bs, num_patches))
+    rand_tensor = jrand.uniform(randkey, (bs, num_patches))
 
     # Sort the random tensor and get the indices
     indices = jnp.argsort(rand_tensor, axis=1)
@@ -156,34 +151,22 @@ def random_mask(
 
     return mask
 
+
 def remove_masked_patches(patches: Array, mask: Array) -> Array:
     """
     Removes the masked patches from the patches tensor while preserving batch dimensions.
     Returned tensor will have shape (bs, number_of_unmasked_patches, embed_dim).
     """
     mask = mask.astype(bool)
-    mask = jnp.logical_not(mask)
 
-    # Get batch size and embed dimension
-    bs, num_patches, embed_dim = patches.shape
+    # Create a mask with the same shape as patches, expanded along the last dimension
+    expanded_mask = jnp.expand_dims(mask, axis=-1)
 
-    # Use boolean indexing to select unmasked patches for each batch
-    unmasked_patches_list = []
-    for i in range(bs):
-        unmasked_patches_list.append(patches[i][mask[i]])
-
-    # Find the maximum number of unmasked patches across all batches
-    max_unmasked_patches = max(map(len, unmasked_patches_list))
-
-    # Pad the unmasked patches with zeros to have a consistent shape
-    padded_unmasked_patches = []
-    for unmasked in unmasked_patches_list:
-        pad_width = max_unmasked_patches - unmasked.shape[0]
-        padding = [(0, pad_width), (0, 0)]  # Pad along the num_patches dimension
-        padded_unmasked_patches.append(jnp.pad(unmasked, padding))
-
-    # Stack the padded unmasked patches
-    unmasked_patches = jnp.stack(padded_unmasked_patches)
+    # Use jnp.where to select patches where the mask is False (unmasked),
+    # otherwise fill with zeros.
+    unmasked_patches = jnp.where(
+        jnp.logical_not(expanded_mask), patches, jnp.zeros_like(patches)
+    )
 
     return unmasked_patches
 
@@ -194,20 +177,39 @@ def add_masked_patches(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
     Returned tensor will have shape (bs, num_patches, embed_dim).
     The missing patches will be filled with 0s.
     """
-   # Ensure mask is a boolean array
+    # Ensure mask is a boolean array
     mask = mask.astype(bool)
 
-    # Get the total number of patches and embed dimension
-    bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
+    # Get the shape information
+    bs, num_patches, embed_dim = patches.shape[0], mask.shape[1], patches.shape[-1]
 
-    # Create a tensor of zeros with the same shape and dtype as the patches tensor
+    # Create a tensor of zeros with the desired shape
     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
 
-    # Iterate over each batch and place unmasked patches back in their original positions
-    for i in range(bs):
-        full_patches = full_patches.at[i, mask[i]].set(patches[i])
+    # Expand the mask to match the shape of full_patches for broadcasting
+    expanded_mask = jnp.expand_dims(mask, axis=-1)
+
+    # Use jnp.where to place the input 'patches' where the mask is True.
+    # Where the mask is False, keep the zeros from 'full_patches'.
+    full_patches = jnp.where(expanded_mask, patches, full_patches)
 
     return full_patches
+
+
+#    # Ensure mask is a boolean array
+#     mask = mask.astype(bool)
+
+#     # Get the total number of patches and embed dimension
+#     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
+
+#     # Create a tensor of zeros with the same shape and dtype as the patches tensor
+#     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
+
+#     # Iterate over each batch and place unmasked patches back in their original positions
+#     for i in range(bs):
+#         full_patches = full_patches.at[i, mask[i]].set(patches[i])
+
+#     return full_patches
 
 
 class uint8(Encoding):
@@ -221,7 +223,8 @@ class uint8(Encoding):
 
 _encodings["uint8"] = uint8
 remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
-local_train_dir = "./imagenet" # just a local mirror path 
+local_train_dir = "./imagenet"  # just a local mirror path
+
 
 def jax_collate(batch):
     latents = jnp.stack([jnp.array(item["vae_output"]) for item in batch], axis=0)
@@ -237,6 +240,7 @@ def jax_collate(batch):
 # modulation with shift and scale
 def modulate(x, shift, scale):
     return x * (1 + scale[:, None]) + shift[:, None]
+
 
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
@@ -292,6 +296,7 @@ const_init1 = nnx.initializers.constant(1)
 linear_init = nnx.initializers.xavier_uniform()
 linear_bias_init = nnx.initializers.constant(1)
 
+
 # input patchify layer, 2D image to patches
 class PatchEmbed:
     def __init__(
@@ -318,6 +323,7 @@ class PatchEmbed:
         x = self.conv_project(x)  # (B, P, P, hidden_size)
         x = rearrange(x, "b h w c -> b (h w) c", h=num_patches_side, w=num_patches_side)
         return x
+
 
 class TimestepEmbedder(nnx.Module):
     def __init__(self, hidden_size, freq_embed_size=256):
@@ -400,7 +406,7 @@ class CaptionEmbedder(nnx.Module):
 class EncoderMLP(nnx.Module):
     def __init__(self, hidden_size, rngs: nnx.Rngs, dropout=0.1):
         super().__init__()
-        
+
         self.layernorm = nnx.LayerNorm(hidden_size, rngs=rngs)
 
         self.linear1 = nnx.Linear(
@@ -434,12 +440,12 @@ class TransformerEncoderBlock(nnx.Module):
             embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init
         )
 
-        self.self_attention =  nnx.MultiHeadAttention(
+        self.self_attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
             in_features=embed_dim,
             decode=False,
             rngs=rngs,
-        ) # SelfAttention(num_heads, embed_dim, rngs=rngs)
+        )  # SelfAttention(num_heads, embed_dim, rngs=rngs)
         self.mlp_layer = EncoderMLP(embed_dim, rngs=rngs)
 
     def __call__(self, x: Array):
@@ -452,7 +458,9 @@ class MLP(nnx.Module):
     def __init__(self, embed_dim, mlp_ratio):
         super().__init__()
         hidden = int(mlp_ratio * embed_dim)
-        self.linear_1 = nnx.Linear(embed_dim, hidden, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init)
+        self.linear_1 = nnx.Linear(
+            embed_dim, hidden, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
+        )
         self.linear_2 = nnx.Linear(
             hidden, embed_dim, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
         )
@@ -473,7 +481,7 @@ class PoolMLP(nnx.Module):
             embed_dim,
             rngs=rngs,
             kernel_init=xavier_init,
-            bias_init=zero_init
+            bias_init=zero_init,
         )
         self.linear_2 = nnx.Linear(
             embed_dim,
@@ -496,9 +504,13 @@ class PoolMLP(nnx.Module):
 # DiT blocks_ #
 ###############
 class DiTBlock(nnx.Module):
-    def __init__(self, hidden_size=768, num_heads=12, mlp_ratio=4, drop: float = 0.0, rngs=rngs):
+    def __init__(
+        self, hidden_size=768, num_heads=12, mlp_ratio=4, drop: float = 0.0, rngs=rngs
+    ):
         super().__init__()
-        self.norm_1 = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init)
+        self.norm_1 = nnx.LayerNorm(
+            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init
+        )
         self.norm_2 = nnx.LayerNorm(
             hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init
         )
@@ -510,9 +522,11 @@ class DiTBlock(nnx.Module):
             rngs=rngs,
         )
         self.adaln = nnx.Linear(
-            hidden_size, 6 * hidden_size, 
-            kernel_init=zero_init, bias_init=zero_init,
-            rngs=rngs
+            hidden_size,
+            6 * hidden_size,
+            kernel_init=zero_init,
+            bias_init=zero_init,
+            rngs=rngs,
         )
         self.mlp_block = MLP(hidden_size, mlp_ratio)
 
@@ -673,8 +687,7 @@ class MicroDiT(nnx.Module):
         self.embed_dim = embed_dim
 
         self.patch_embedder = PatchEmbed(
-            rngs=rngs, patch_size=patch_size[0], 
-            in_chan=in_channels, embed_dim=embed_dim
+            patch_size=patch_size[0], in_channels=in_channels, dim=embed_dim
         )
 
         self.num_patches = self.patch_embedder.num_patches
@@ -689,7 +702,7 @@ class MicroDiT(nnx.Module):
             in_features=embed_dim,
             kernel_init=xavier_init,
             rngs=rngs,
-            decode=False
+            decode=False,
         )  # CrossAttention(attn_heads, embed_dim, cond_embed_dim, rngs=rngs)
         self.cond_mlp = MLP(embed_dim, mlp_ratio=4)
 
@@ -727,24 +740,31 @@ class MicroDiT(nnx.Module):
         reconstructed = x.reshape((bs, height, width, in_channels))
         return reconstructed
 
-    def __call__(self, x: Array, t: Array, y_cap: Array, mask: Array=None, train=False):
+    def __call__(
+        self, x: Array, t: Array, y_cap: Array, mask: Array = None, train=False
+    ):
         bsize, height, width, channels = x.shape
         x = self.patch_embedder(x)
 
-        pos_embed = get_2d_sincos_pos_embed(embed_dim=self.dim, length=self.num_patches)
-        print(f'posembed 1 = {pos_embed.shape}')
-        pos_embed = jnp.expand_dims(pos_embed, axis=0)
-        pos_embed = jnp.broadcast_to(pos_embed, (bsize, pos_embed.shape[1], pos_embed.shape[2]))
-        pos_embed = jnp.reshape(
-            pos_embed, shape=(bsize, self.num_patches, self.embed_dim)
+        pos_embed = get_2d_sincos_pos_embed(
+            embed_dim=self.embed_dim, length=self.num_patches
         )
-        print(f'{x.shape = } / {pos_embed.shape = }')
+        print(f"posembed 1 = {pos_embed.shape} / x {x.shape}")
+        # pos_embed = jnp.expand_dims(pos_embed, axis=0)
+        pos_embed = jnp.broadcast_to(
+            pos_embed, (bsize, pos_embed.shape[1], pos_embed.shape[2])
+        )
+        # pos_embed = jnp.reshape(
+        #     pos_embed, shape=(bsize, self.num_patches, self.embed_dim)
+        # )
+        print(f"{x.shape = } / {pos_embed.shape = }")
 
+        # conditioning layers
         x = x + pos_embed
 
         # cond_embed = self.cap_embedder(y_cap) # (b, embdim)
         label_embed = self.label_embedder(y_cap, train=train)
-        print(f'label_embed = {label_embed.shape}')
+        print(f"label_embed = {label_embed.shape}")
         # label_embed_unsqueeze = jnp.expand_dims(label_embed, axis=1)
 
         time_embed = self.time_embedder(t)
@@ -754,7 +774,6 @@ class MicroDiT(nnx.Module):
         # mha_out = mha_out.squeeze(1)
         cond_ty = time_embed + label_embed
         mlp_cond = self.cond_mlp(cond_ty)
-
         # pooling the conditions
         # pool_out = self.pool_mlp(jnp.expand_dims(mlp_cond, axis=2))
 
@@ -762,12 +781,13 @@ class MicroDiT(nnx.Module):
 
         cond_signal = jnp.expand_dims(self.linear(mlp_cond), axis=1)
         cond_signal = jnp.broadcast_to(cond_signal, shape=(x.shape))
+        print(f"{mlp_cond.shape = } / {cond_signal.shape = }")
 
-        print(f'{cond_signal.shape = }')
         x = x + cond_signal
         x = self.patch_mixer(x)
 
         if mask is not None:
+            print(f"{mask.shape = }")
             x = remove_masked_patches(x, mask)
 
         # mlp_out_us = jnp.expand_dims(mlp_cond, axis=1)
@@ -775,8 +795,8 @@ class MicroDiT(nnx.Module):
         # cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
 
         # x = x + cond
-        
-        print(f'x masked / {x.shape}')
+
+        print(f"x masked / {x.shape}")
         x = self.backbone(x, cond_ty)
 
         x = self.final_linear(x, cond_ty)
@@ -784,8 +804,8 @@ class MicroDiT(nnx.Module):
         # add back masked patches
         if mask is not None:
             x = add_masked_patches(x, mask)
-            print(f'x unmasked / {x.shape}')
-            
+            print(f"x unmasked / {x.shape}")
+
         x = self._unpatchify(x)
 
         return x
@@ -826,14 +846,17 @@ class RectFlowWrapper(nnx.Module):
 
         rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
-    
+
         inshape = [1] * len(x_input.shape[1:])
         texp = rand_t.reshape([b_size, *(inshape)]).astype(jnp.bfloat16)
 
-        z_noise = jrand.uniform(randkey, x_input.shape).astype(jnp.bfloat16)  # input noise with same dim as image
+        z_noise = jrand.uniform(randkey, x_input.shape).astype(
+            jnp.bfloat16
+        )  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
         v_thetha = self.model(z_noise_t, rand_t, cond, mask, train=True)
+        print(f"{v_thetha.shape = }")
 
         mean_dim = list(
             range(1, len(x_input.shape))
@@ -848,11 +871,11 @@ class RectFlowWrapper(nnx.Module):
 
         loss = jnp.mean(batchwise_mse_loss)
         loss = loss * 1 / (1 - config.mask_ratio)
-        
-        return v_thetha, loss
-    
 
-    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=3.0):
+        return v_thetha, loss
+
+    def sample(self, cond, sample_steps=50, cfg=3.0):
+        z_latent = jrand.normal(randkey, (len(cond), 32, 32, 4))  # noise
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
 
@@ -867,7 +890,7 @@ class RectFlowWrapper(nnx.Module):
 
             vcond = self.model(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
-            v_uncond = self.model(z_latent, t, null_cond) # type: ignore
+            v_uncond = self.model(z_latent, t, null_cond)  # type: ignore
             vcond = v_uncond + cfg * (vcond - v_uncond)
 
             z_latent = z_latent - dt * vcond
@@ -885,6 +908,7 @@ def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
         settings=wandb.Settings(init_timeout=120),
     )
 
+
 def device_get_model(model):
     state = nnx.state(model)
     state = jax.device_get(state)
@@ -894,6 +918,7 @@ def device_get_model(model):
 
 
 def sample_image_batch(step, model, labels):
+    print(f"sampling from labels {labels}")
     pred_model = device_get_model(model)
     pred_model.eval()
     image_batch = pred_model.sample(labels)
@@ -979,8 +1004,8 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
 @nnx.jit
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
-        img_latents, label = batch['vae_output'], batch['label']
-        
+        img_latents, label = batch["vae_output"], batch["label"]
+
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
         img_latents = rearrange(img_latents, "b c h w -> b h w c")
         # print(f"latents => {img_latents.shape}")
@@ -1003,13 +1028,13 @@ def train_step(model, optimizer, batch):
     gradfn = nnx.value_and_grad(loss_func)
     loss, grads = gradfn(model, batch)
     optimizer.update(grads)
-    
+
     return loss
 
 
 def trainer(epochs, model, optimizer, train_loader):
     train_loss = 0.0
-    
+
     model.train()
 
     # wandb_logger(
@@ -1020,7 +1045,7 @@ def trainer(epochs, model, optimizer, train_loader):
     stime = time.time()
     sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
 
-    for epoch in tqdm(range(epochs), desc='Training..../'):
+    for epoch in tqdm(range(epochs), desc="Training..../"):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss = train_step(model, optimizer, batch)
@@ -1042,7 +1067,7 @@ def trainer(epochs, model, optimizer, train_loader):
         print(f"epoch {epoch+1}, train loss => {train_loss}")
         path = f"{epoch}_microdit_imagenet_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
-        
+
         epoch_file = sample_image_batch(step, model, sample_labels)
         epoch_image_log = wandb.Image(epoch_file)
         # wandb.log({"epoch_sample": epoch_image_log})
@@ -1068,15 +1093,15 @@ def overfit(epochs, model, optimizer, train_loader):
     stime = time.time()
 
     batch = next(iter(train_loader))
-    
+
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         train_loss = train_step(model, optimizer, batch)
         print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
         # wandb.log({"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())})
-        
+
         if epoch % 50 == 0:
-            gridfile = sample_image_batch(epoch, model, batch['label'])
+            gridfile = sample_image_batch(epoch, model, batch["label"])
             image_log = wandb.Image(gridfile)
             # wandb.log({"image_sample": image_log})
 
@@ -1084,21 +1109,23 @@ def overfit(epochs, model, optimizer, train_loader):
         gc.collect()
 
     etime = time.time() - stime
-    print(f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs")
-        
-    epoch_file = sample_image_batch('overfit', model, batch['labels'])
+    print(
+        f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
+    )
+
+    epoch_file = sample_image_batch("overfit", model, batch["labels"])
     epoch_image_log = wandb.Image(epoch_file)
     # wandb.log({"epoch_sample": epoch_image_log})
-    
+
     return model, train_loss
 
 
 @click.command()
-@click.option('-r', '--run', default='overfit')
-@click.option('-e', '--epochs', default=30)
+@click.option("-r", "--run", default="overfit")
+@click.option("-e", "--epochs", default=30)
 @click.option("-bs", "--batch_size", default=config.batch_size)
 def main(run, epochs, batch_size):
-    
+
     streaming.base.util.clean_stale_shared_memory()
     dataset = StreamingDataset(
         local=local_train_dir,
@@ -1115,7 +1142,9 @@ def main(run, epochs, batch_size):
     )
 
     sp = next(iter(train_loader))
-    print(f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, labels = {sp['label']}")
+    print(
+        f"loaded dataset, sample shape {sp['vae_output'].shape} /  {sp['label'].shape}, labels = {sp['label']}"
+    )
 
     microdit = MicroDiT(
         in_channels=4,
@@ -1139,14 +1168,15 @@ def main(run, epochs, batch_size):
     state = jax.device_put(state, rep_sharding)
     nnx.update((rf_engine, optimizer), state)
 
-    if run=='overfit':
+    if run == "overfit":
         model, loss = overfit(epochs, rf_engine, optimizer, train_loader)
         wandb.finish()
         print(f"microdit overfitting ended at loss {loss:.4f}")
-    
-    elif run=='train':
+
+    elif run == "train":
         trainer(epochs, rf_engine, optimizer, train_loader)
         wandb.finish()
         print("microdit (test) training (on imagenet-1k) in JAX..done")
+
 
 main()
