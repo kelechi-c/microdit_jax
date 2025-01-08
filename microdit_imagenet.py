@@ -1027,9 +1027,10 @@ def train_step(model, optimizer, batch):
 
     gradfn = nnx.value_and_grad(loss_func)
     loss, grads = gradfn(model, batch)
+    grad_norm = optax.global_norm(grads)
     optimizer.update(grads)
 
-    return loss
+    return loss, grad_norm
 
 
 def trainer(epochs, model, optimizer, train_loader):
@@ -1049,12 +1050,15 @@ def trainer(epochs, model, optimizer, train_loader):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
 
             train_loss = train_step(model, optimizer, batch)
-            print(f"step {step}, loss-> {train_loss.item():.4f}")
 
-            # wandb.log({
-            #     "loss": train_loss.item(),
-            #     "log_loss": math.log10(train_loss.item())
-            # })
+            train_loss, grad_norm = train_step(model, optimizer, batch)
+            print(f"step {step}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}")
+
+            wandb.log({
+                "loss": train_loss.item(),
+                "log_loss": math.log10(train_loss.item()),
+                "grad_norm": grad_norm
+            })
 
             if step % 1000 == 0:
                 gridfile = sample_image_batch(step, model, sample_labels)
@@ -1097,9 +1101,15 @@ def overfit(epochs, model, optimizer, train_loader):
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         train_loss = train_step(model, optimizer, batch)
-        print(f"epoch {epoch+1}/{epochs}, train loss => {train_loss.item():.4f}")
-        # wandb.log({"loss": train_loss.item(), "log_loss": math.log10(train_loss.item())})
+        train_loss, grad_norm = train_step(model, optimizer, batch)
+        print(f"step {epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}")
 
+        wandb.log({
+            "loss": train_loss.item(),
+            "log_loss": math.log10(train_loss.item()),
+            "grad_norm": grad_norm
+        })
+        
         if epoch % 50 == 0:
             gridfile = sample_image_batch(epoch, model, batch["label"])
             image_log = wandb.Image(gridfile)
