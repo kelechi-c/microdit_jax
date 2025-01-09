@@ -1099,7 +1099,7 @@ def overfit(epochs, model, optimizer, train_loader):
     model.train()
 
     wandb_logger(
-        key="3aef5402e364c9da47508adf8be0664512ed30b2", project_name="microdit_overfit"
+        key="", project_name="microdit_overfit"
     )
 
     stime = time.time()
@@ -1170,6 +1170,8 @@ def main(run, epochs, batch_size):
         attn_heads=12,
         patchmix_layers=6
     )
+    
+    
 
     rf_engine = RectFlowWrapper(microdit)
     graph, state = nnx.split(rf_engine)
