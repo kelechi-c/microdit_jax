@@ -28,6 +28,7 @@ rkey = jrand.key(config.seed)
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
 
+
 def apply_mask(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> Array:
     """
     Applies a mask to a tensor. Turns the masked values to 0s.
@@ -218,13 +219,11 @@ def get_2d_sincos_pos_embed(embed_dim, length):
 
 xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
-const_init1 = nnx.initializers.constant(1)
-linear_init = nnx.initializers.xavier_uniform()
-linear_bias_init = nnx.initializers.constant(1)
-
+one_init = nnx.initializers.constant(1)
+normal_init = nnx.initializers.normal(0.02)
 
 # input patchify layer, 2D image to patches
-class PatchEmbed:
+class PatchEmbed(nnx.Module):
     def __init__(
         self, in_channels=4, img_size: int = 32, dim=1024, patch_size: int = 2
     ):
@@ -237,8 +236,8 @@ class PatchEmbed:
             dim,
             kernel_size=patch_tuple,
             strides=patch_tuple,
-            use_bias=False,
             padding="VALID",
+            bias_init=zero_init,
             kernel_init=xavier_init,
             rngs=rngs,
         )
@@ -259,14 +258,14 @@ class TimestepEmbedder(nnx.Module):
             hidden_size,
             rngs=rngs,
             bias_init=zero_init,
-            kernel_init=xavier_init,
+            kernel_init=normal_init,
         )
         self.lin_2 = nnx.Linear(
             hidden_size,
             hidden_size,
             rngs=rngs,
             bias_init=zero_init,
-            kernel_init=xavier_init,
+            kernel_init=normal_init,
         )
         self.freq_embed_size = freq_embed_size
 
@@ -300,7 +299,7 @@ class LabelEmbedder(nnx.Module):
             num_classes + int(use_cfg_embeddings),
             hidden_size,
             rngs=rngs,
-            embedding_init=nnx.initializers.normal(0.02),
+            embedding_init=normal_init,
         )
         self.num_classes = num_classes
         self.dropout = drop
@@ -375,8 +374,12 @@ class EncoderMLP(nnx.Module):
 class TransformerEncoderBlock(nnx.Module):
     def __init__(self, embed_dim, num_heads, drop=0.1):
         super().__init__()
-        self.layernorm = nnx.LayerNorm(
-            embed_dim, epsilon=1e-6, rngs=rngs, use_bias=False
+        self.norm1 = nnx.LayerNorm(
+            embed_dim, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
+        )
+
+        self.norm2 = nnx.LayerNorm(
+            embed_dim, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
         )
 
         self.self_attention = nnx.MultiHeadAttention(
@@ -387,12 +390,14 @@ class TransformerEncoderBlock(nnx.Module):
             dropout_rate=drop,
             bias_init=zero_init,
             kernel_init=xavier_init,
+            out_bias_init=zero_init,
+            out_kernel_init=xavier_init,
         )  # SelfAttention(num_heads, embed_dim, rngs=rngs)
         self.mlp_layer = EncoderMLP(embed_dim, rngs=rngs)
 
     def __call__(self, x: Array):
-        x = x + self.self_attention(self.layernorm(x))
-        x = x + self.mlp_layer(self.layernorm(x))
+        x = x + self.self_attention(self.norm1(x))
+        x = x + self.mlp_layer(self.norm2(x))
         return x
 
 
@@ -451,10 +456,10 @@ class DiTBlock(nnx.Module):
     ):
         super().__init__()
         self.norm_1 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init
+            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
         )
         self.norm_2 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, bias_init=zero_init
+            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
         )
         self.attention = nnx.MultiHeadAttention(
             num_heads=num_heads,
@@ -464,6 +469,8 @@ class DiTBlock(nnx.Module):
             rngs=rngs,
             bias_init=zero_init,
             kernel_init=xavier_init,
+            out_bias_init=zero_init,
+            out_kernel_init=xavier_init,
         )
         self.adaln = nnx.Linear(
             hidden_size,
@@ -496,13 +503,16 @@ class FinalMLP(nnx.Module):
     ):
         super().__init__()
 
-        self.norm_final = nnx.LayerNorm(hidden_size, epsilon=1e-6, rngs=rngs)
+        self.norm_final = nnx.LayerNorm(
+            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
+        )
+
         self.linear = nnx.Linear(
             hidden_size,
             patch_size[0] * patch_size[1] * out_channels,
             rngs=rngs,
+            kernel_init=zero_init,
             bias_init=zero_init,
-            kernel_init=xavier_init,
         )
 
         self.adaln_linear = nnx.Linear(
@@ -653,7 +663,13 @@ class MicroDiT(nnx.Module):
         # pooling layer
         # self.pool_mlp = PoolMLP(embed_dim)
 
-        self.linear = nnx.Linear(self.embed_dim, self.embed_dim, rngs=rngs)
+        self.linear = nnx.Linear(
+            self.embed_dim,
+            self.embed_dim,
+            rngs=rngs,
+            bias_init=zero_init,
+            kernel_init=xavier_init,
+        )
 
         self.patch_mixer = PatchMixer(embed_dim, attn_heads, patchmix_layers)
 
