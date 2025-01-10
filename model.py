@@ -172,7 +172,7 @@ def modulate(x, shift, scale):
 # From https://github.com/young-geng/m3ae_public/blob/master/m3ae/model.py
 def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
     assert embed_dim % 2 == 0
-    omega = jnp.arange(embed_dim // 2, dtype=jnp.float32)
+    omega = jnp.arange(embed_dim // 2, dtype=jnp.bfloat16)
     omega /= embed_dim / 2.0
     omega = 1.0 / 10000**omega  # (D/2,)
 
@@ -189,7 +189,7 @@ def get_1d_sincos_pos_embed_from_grid(embed_dim, pos):
 def get_1d_sincos_pos_embed(embed_dim, length):
     return jnp.expand_dims(
         get_1d_sincos_pos_embed_from_grid(
-            embed_dim, jnp.arange(length, dtype=jnp.float32)
+            embed_dim, jnp.arange(length, dtype=jnp.bfloat16)
         ),
         axis=0,
     )
@@ -208,8 +208,8 @@ def get_2d_sincos_pos_embed(embed_dim, length):
         emb = jnp.concatenate([emb_h, emb_w], axis=1)  # (H*W, D)
         return emb
 
-    grid_h = jnp.arange(grid_size, dtype=jnp.float32)
-    grid_w = jnp.arange(grid_size, dtype=jnp.float32)
+    grid_h = jnp.arange(grid_size, dtype=jnp.bfloat16)
+    grid_w = jnp.arange(grid_size, dtype=jnp.bfloat16)
     grid = jnp.meshgrid(grid_w, grid_h)  # here w goes first
     grid = jnp.stack(grid, axis=0)
     grid = grid.reshape([2, 1, grid_size, grid_size])
@@ -221,6 +221,7 @@ xavier_init = nnx.initializers.xavier_uniform()
 zero_init = nnx.initializers.constant(0)
 one_init = nnx.initializers.constant(1)
 normal_init = nnx.initializers.normal(0.02)
+
 
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
@@ -781,9 +782,13 @@ class MicroDiT(nnx.Module):
     def log_activation_stats(self, layer_name, activations):
         mean_val = jnp.mean(activations)
         std_val = jnp.std(activations)
-        jax.debug.print("layer {val} / mean {mean_val} / stddev {std_val}",val=layer_name, mean_val=mean_val, std_val=std_val)
-        
-        
+        jax.debug.print(
+            "layer {val} / mean {mean_val} / stddev {std_val}",
+            val=layer_name,
+            mean_val=mean_val,
+            std_val=std_val,
+        )
+
     def sample(self, z_latent: Array, cond, sample_steps=50, cfg=3.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
@@ -795,7 +800,7 @@ class MicroDiT(nnx.Module):
 
         for step in tqdm(range(sample_steps, 0, -1)):
             t = step / sample_steps
-            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.float32)
+            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
 
             vcond = self(z_latent, t, cond, mask=None, train=False)
             null_cond = jnp.zeros_like(cond)
@@ -816,16 +821,16 @@ class RectFlowWrapper(nnx.Module):
 
     def __call__(self, x_input: Array, cond: Array, mask):
         b_size = x_input.shape[0]  # batch_size
-        mask = mask.astype(jnp.float32)
+        mask = mask.astype(jnp.bfloat16)
 
-        rand = jrand.uniform(randkey, (b_size,)).astype(jnp.float32)
+        rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
 
         inshape = [1] * len(x_input.shape[1:])
-        texp = rand_t.reshape([b_size, *(inshape)]).astype(jnp.float32)
+        texp = rand_t.reshape([b_size, *(inshape)]).astype(jnp.bfloat16)
 
         z_noise = jrand.uniform(randkey, x_input.shape).astype(
-            jnp.float32
+            jnp.bfloat16
         )  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
@@ -860,7 +865,7 @@ class RectFlowWrapper(nnx.Module):
 
         for step in tqdm(range(sample_steps, 0, -1)):
             t = step / sample_steps
-            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.float32)
+            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
 
             vcond = self.model(z_latent, t, cond, None)
             null_cond = jnp.zeros_like(cond)
