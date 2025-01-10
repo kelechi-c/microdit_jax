@@ -781,10 +781,9 @@ class MicroDiT(nnx.Module):
     def log_activation_stats(self, layer_name, activations):
         mean_val = jnp.mean(activations)
         std_val = jnp.std(activations)
-        jax.debug.print(
-            f"Activation - Layer: {layer_name}, Mean: {mean_val}, StdDev: {std_val}"
-        )
-
+        jax.debug.print("layer {val} / mean {mean_val} / stddev {std_val}",val=layer_name, mean_val=mean_val, std_val=std_val)
+        
+        
     def sample(self, z_latent: Array, cond, sample_steps=50, cfg=3.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
