@@ -52,3 +52,43 @@ def check_weight_stats(params):
                 print(
                     f"Layer: {layer_name}, Param: {param_name}, Mean: {mean_val:.4f}, StdDev: {std_val:.4f}"
                 )
+
+
+def log_state_values(state_layer):
+    try:
+        if isinstance(state_layer, jax.Array):
+            mean_val = jnp.mean(state_layer)
+            std_val = jnp.std(state_layer)
+            print(f"layer: Mean: {mean_val}, StdDev: {std_val}")
+    except Exception as e:
+        print(f"inspect error {e}")
+
+def log_activation_stats(layer_name, activations):
+    mean_val = jnp.mean(activations)
+    std_val = jnp.std(activations)
+    jax.debug.print(
+        "layer {val} / mean {mean_val} / stddev {std_val}",
+        val=layer_name,
+        mean_val=mean_val,
+        std_val=std_val,
+    )
+
+
+def jax_collate(batch):
+    latents = jnp.stack(
+        [jnp.array(item["vae_output"], dtype=jnp.bfloat16) for item in batch], axis=0
+    )
+    labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
+
+    return {
+        "vae_output": latents,
+        "label": labels,
+    }
+
+def device_get_model(model):
+    state = nnx.state(model)
+    state = jax.device_get(state)
+    nnx.update(model, state)
+
+    return model
+
