@@ -611,13 +611,14 @@ class TransformerBackbone(nnx.Module):
 class PatchMixer(nnx.Module):
     def __init__(self, embed_dim, attn_heads, n_layers=2):
         super().__init__()
-        layers = [
+        self.layers = [
             TransformerEncoderBlock(embed_dim, attn_heads) for _ in range(n_layers)
         ]
-        self.encoder_layers = nnx.Sequential(*layers)
 
     def __call__(self, x: Array) -> Array:
-        x = self.encoder_layers(x)
+        for layer in self.layers:
+            x = layer(x)
+            
         return x
 
 
@@ -683,7 +684,14 @@ class MicroDiT(nnx.Module):
             num_heads=attn_heads,
         )
 
-        self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
+        self.final_linear = nnx.Linear(
+            embed_dim,
+            patch_size[0] * patch_size[1] * in_channels,
+            rngs=rngs,
+            kernel_init=zero_init,
+            bias_init=zero_init,
+        )
+#FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
     def _unpatchify(self, x, patch_size=(2, 2), height=32, width=32):
         bs, num_patches, patch_dim = x.shape
@@ -759,13 +767,13 @@ class MicroDiT(nnx.Module):
 
         # cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
 
-        # x = x + cond
+        x = x + cond_signal
 
         # print(f'x masked / {x.shape}')
-        x = self.backbone(x, cond_ty)
+        x = self.backbone(x, label_embed)
         # self.log_activation_stats("transformer_backbone", x)
 
-        x = self.final_linear(x, cond_ty)
+        x = self.final_linear(x)
         # self.log_activation_stats("final_layer", x)
 
         # add back masked patches
