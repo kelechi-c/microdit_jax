@@ -28,7 +28,6 @@ rkey = jrand.key(config.seed)
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
 
-
 def apply_mask(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> Array:
     """
     Applies a mask to a tensor. Turns the masked values to 0s.
@@ -108,43 +107,39 @@ def remove_masked_patches(patches: Array, mask: Array) -> Array:
     Removes the masked patches from the patches tensor while preserving batch dimensions.
     Returned tensor will have shape (bs, number_of_unmasked_patches, embed_dim).
     """
-    mask = mask.astype(bool)
+    mask = jnp.logical_not(mask)
+    bs, num_patches, embed_dim = patches.shape
 
-    # Create a mask with the same shape as patches, expanded along the last dimension
-    expanded_mask = jnp.expand_dims(mask, axis=-1)
+    # Method 1: Using take with nonzero
+    # Reshape mask to 2D (combining batch and patches)
+    mask_flat = mask.reshape(-1)
+    indices = jnp.nonzero(mask_flat, size=mask.shape[1])[0]
 
-    # Use jnp.where to select patches where the mask is False (unmasked),
-    # otherwise fill with zeros.
-    unmasked_patches = jnp.where(
-        jnp.logical_not(expanded_mask), patches, jnp.zeros_like(patches)
-    )
+    patches_flat = patches.reshape(-1, embed_dim)
 
-    return unmasked_patches
+    unmasked_patches = jnp.take(patches_flat, indices, axis=0)
+
+    return unmasked_patches.reshape(bs, -1, embed_dim)
 
 
-def add_masked_patches(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
+def add_masked_patches(patches: np.ndarray, mask) -> np.ndarray:
     """
     Adds the masked patches to the patches tensor.
     Returned tensor will have shape (bs, num_patches, embed_dim).
     The missing patches will be filled with 0s.
     """
-    # Ensure mask is a boolean array
-    mask = mask.astype(bool)
+    mask = mask.astype(jnp.bool_)
 
-    # Get the shape information
-    bs, num_patches, embed_dim = patches.shape[0], mask.shape[1], patches.shape[-1]
+    bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
 
-    # Create a tensor of zeros with the desired shape
     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
 
-    # Expand the mask to match the shape of full_patches for broadcasting
-    expanded_mask = jnp.expand_dims(mask, axis=-1)
+    reshaped_patches = patches.reshape(-1, embed_dim)
 
-    # Use jnp.where to place the input 'patches' where the mask is True.
-    # Where the mask is False, keep the zeros from 'full_patches'.
-    full_patches = jnp.where(expanded_mask, patches, full_patches)
+    full_patches = jnp.where(mask[..., None], reshaped_patches, full_patches)
 
     return full_patches
+
 
 
 #    # Ensure mask is a boolean array
