@@ -28,6 +28,7 @@ rkey = jrand.key(config.seed)
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
 
+
 def apply_mask(x: jnp.ndarray, mask: jnp.ndarray, patch_size: tuple[int, int]) -> Array:
     """
     Applies a mask to a tensor. Turns the masked values to 0s.
@@ -122,7 +123,21 @@ def remove_masked_patches(patches: Array, mask: Array) -> Array:
     return unmasked_patches.reshape(bs, -1, embed_dim)
 
 
-def add_masked_patches(patches: np.ndarray, mask) -> np.ndarray:
+    # mask = mask.astype(bool)
+
+    # # Create a mask with the same shape as patches, expanded along the last dimension
+    # expanded_mask = jnp.expand_dims(mask, axis=-1)
+
+    # # Use jnp.where to select patches where the mask is False (unmasked),
+    # # otherwise fill with zeros.
+    # unmasked_patches = jnp.where(
+    #     jnp.logical_not(expanded_mask), patches, jnp.zeros_like(patches)
+    # )
+
+    # return unmasked_patches
+
+
+def add_masked_patches(patches: np.ndarray, mask: np.ndarray, og_shape=(8, 256, 1152)) -> np.ndarray:
     """
     Adds the masked patches to the patches tensor.
     Returned tensor will have shape (bs, num_patches, embed_dim).
@@ -139,23 +154,6 @@ def add_masked_patches(patches: np.ndarray, mask) -> np.ndarray:
     full_patches = jnp.where(mask[..., None], reshaped_patches, full_patches)
 
     return full_patches
-
-
-
-#    # Ensure mask is a boolean array
-#     mask = mask.astype(bool)
-
-#     # Get the total number of patches and embed dimension
-#     bs, num_patches, embed_dim = mask.shape[0], mask.shape[1], patches.shape[-1]
-
-#     # Create a tensor of zeros with the same shape and dtype as the patches tensor
-#     full_patches = jnp.zeros((bs, num_patches, embed_dim), dtype=patches.dtype)
-
-#     # Iterate over each batch and place unmasked patches back in their original positions
-#     for i in range(bs):
-#         full_patches = full_patches.at[i, mask[i]].set(patches[i])
-
-#     return full_patches
 
 
 # model helper functions
@@ -221,7 +219,9 @@ normal_init = nnx.initializers.normal(0.02)
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
     def __init__(
-        self, in_channels=4, img_size: int = 32, dim=1024, patch_size: int = 2
+        self, in_channels=4,
+        img_size: int = 32, dim=1024, 
+        patch_size: int = 2
     ):
         self.dim = dim
         self.patch_size = patch_size
@@ -232,8 +232,8 @@ class PatchEmbed(nnx.Module):
             dim,
             kernel_size=patch_tuple,
             strides=patch_tuple,
+            use_bias=False,
             padding="VALID",
-            bias_init=zero_init,
             kernel_init=xavier_init,
             rngs=rngs,
         )
@@ -244,7 +244,6 @@ class PatchEmbed(nnx.Module):
         x = self.conv_project(x)  # (B, P, P, hidden_size)
         x = rearrange(x, "b h w c -> b (h w) c", h=num_patches_side, w=num_patches_side)
         return x
-
 
 class TimestepEmbedder(nnx.Module):
     def __init__(self, hidden_size, freq_embed_size=256):
@@ -320,85 +319,8 @@ class LabelEmbedder(nnx.Module):
         return label_embeds
 
 
-# class CaptionEmbedder(nnx.Module):
-#     def __init__(self, cap_embed_dim, embed_dim):
-#         super().__init__()
-#         self.linear_1 = nnx.Linear(cap_embed_dim, embed_dim, rngs=rngs)
-#         self.linear_2 = nnx.Linear(embed_dim, embed_dim, rngs=rngs)
-
-#     def __call__(self, x: Array) -> Array:
-#         x = nnx.silu(self.linear_1(x))
-#         x = self.linear_2(x)
-
-#         return x
-
-
-########################
-# Patch Mixer components
-########################
-class EncoderMLP(nnx.Module):
-    def __init__(self, hidden_size, rngs: nnx.Rngs, dropout=0.0):
-        super().__init__()
-
-        self.layernorm = nnx.LayerNorm(hidden_size, rngs=rngs)
-
-        self.linear1 = nnx.Linear(
-            hidden_size,
-            4 * hidden_size,
-            rngs=rngs,
-            bias_init=zero_init,
-            kernel_init=xavier_init,
-        )
-        self.linear2 = nnx.Linear(
-            4 * hidden_size,
-            hidden_size,
-            rngs=rngs,
-            bias_init=zero_init,
-            kernel_init=xavier_init,
-        )
-        self.dropout = nnx.Dropout(dropout, rngs=rngs)
-
-    def __call__(self, x_input: jax.Array) -> jax.Array:
-        x = self.layernorm(x_input)
-        x = nnx.silu(self.linear1(x))
-        x = self.linear2(x)
-        x = self.dropout(x)
-
-        return x
-
-
-class TransformerEncoderBlock(nnx.Module):
-    def __init__(self, embed_dim, num_heads, drop=0.1):
-        super().__init__()
-        self.norm1 = nnx.LayerNorm(
-            embed_dim, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
-        )
-
-        self.norm2 = nnx.LayerNorm(
-            embed_dim, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
-        )
-
-        self.self_attention = nnx.MultiHeadAttention(
-            num_heads=num_heads,
-            in_features=embed_dim,
-            decode=False,
-            rngs=rngs,
-            dropout_rate=drop,
-            bias_init=zero_init,
-            kernel_init=xavier_init,
-            out_bias_init=zero_init,
-            out_kernel_init=xavier_init,
-        )  # SelfAttention(num_heads, embed_dim, rngs=rngs)
-        self.mlp_layer = EncoderMLP(embed_dim, rngs=rngs)
-
-    def __call__(self, x: Array):
-        x = x + self.self_attention(self.norm1(x))
-        x = x + self.mlp_layer(self.norm2(x))
-        return x
-
-
 class MLP(nnx.Module):
-    def __init__(self, embed_dim, mlp_ratio):
+    def __init__(self, embed_dim, mlp_ratio=4):
         super().__init__()
         hidden = int(mlp_ratio * embed_dim)
         self.linear_1 = nnx.Linear(
@@ -415,51 +337,49 @@ class MLP(nnx.Module):
         return x
 
 
-# # Pool + MLP for (MHA + MLP)
-# class PoolMLP(nnx.Module):
-#     def __init__(self, embed_dim):
-#         super().__init__()
-#         self.linear_1 = nnx.Linear(
-#             embed_dim,
-#             embed_dim,
-#             rngs=rngs,
-#             kernel_init=xavier_init,
-#             bias_init=zero_init
-#         )
-#         self.linear_2 = nnx.Linear(
-#             embed_dim,
-#             embed_dim,
-#             rngs=rngs,
-#             kernel_init=xavier_init,
-#             bias_init=zero_init,
-#         )
+# Pool + MLP for (MHA + MLP)
+class PoolMLP(nnx.Module):
+    def __init__(self, embed_dim):
+        super().__init__()
+        self.linear_1 = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init
+        )
+        self.linear_2 = nnx.Linear(
+            embed_dim,
+            embed_dim,
+            rngs=rngs,
+            kernel_init=xavier_init,
+            bias_init=zero_init,
+        )
 
-#     def __call__(self, x: Array) -> Array:
-#         x = nnx.avg_pool(x, (1,))
-#         x = jnp.reshape(x, shape=(x.shape[0], -1))
-#         x = nnx.gelu(self.linear_1(x))
-#         x = self.linear_2(x)
+    def __call__(self, x: Array) -> Array:
+        x = nnx.avg_pool(x, (1,))
+        x = jnp.reshape(x, shape=(x.shape[0], -1))
+        x = nnx.gelu(self.linear_1(x))
+        x = self.linear_2(x)
 
-#         return x
+        return x
 
 
 ###############
 # DiT blocks_ #
 ###############
+
 class DiTBlock(nnx.Module):
     def __init__(
-        self, hidden_size=768, num_heads=12, mlp_ratio=4, drop: float = 0.1, rngs=rngs
+        self, dim: int, attn_heads: int, drop: float = 0.0, rngs=nnx.Rngs(config.seed)
     ):
         super().__init__()
-        self.norm_1 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
-        )
-        self.norm_2 = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
-        )
+        self.dim = dim
+        self.norm_1 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init)
+        self.norm_2 = nnx.LayerNorm(dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init)
         self.attention = nnx.MultiHeadAttention(
-            num_heads=num_heads,
-            in_features=hidden_size,
+            num_heads=attn_heads,
+            in_features=dim,
             decode=False,
             dropout_rate=drop,
             rngs=rngs,
@@ -468,14 +388,11 @@ class DiTBlock(nnx.Module):
             out_bias_init=zero_init,
             out_kernel_init=xavier_init,
         )
+        
         self.adaln = nnx.Linear(
-            hidden_size,
-            6 * hidden_size,
-            kernel_init=zero_init,
-            bias_init=zero_init,
-            rngs=rngs,
+            dim, 6 * dim, kernel_init=zero_init, bias_init=zero_init, rngs=rngs
         )
-        self.mlp_block = MLP(hidden_size, mlp_ratio)
+        self.mlp_block = MLP(dim)
 
     def __call__(self, x_img: Array, cond: Array):
         cond = self.adaln(nnx.silu(cond))
@@ -493,40 +410,40 @@ class DiTBlock(nnx.Module):
         return x
 
 
-class FinalMLP(nnx.Module):
-    def __init__(
-        self, hidden_size, patch_size, out_channels, rngs=nnx.Rngs(config.seed)
-    ):
-        super().__init__()
+# # class FinalMLP(nnx.Module):
+# #     def __init__(
+# #         self, hidden_size, patch_size, out_channels, rngs=nnx.Rngs(config.seed)
+# #     ):
+# #         super().__init__()
 
-        self.norm_final = nnx.LayerNorm(
-            hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
-        )
+# #         self.norm_final = nnx.LayerNorm(
+# #             hidden_size, epsilon=1e-6, rngs=rngs, use_bias=False, scale_init=one_init
+# #         )
 
-        self.linear = nnx.Linear(
-            hidden_size,
-            patch_size[0] * patch_size[1] * out_channels,
-            rngs=rngs,
-            kernel_init=zero_init,
-            bias_init=zero_init,
-        )
+# #         self.linear = nnx.Linear(
+# #             hidden_size,
+#             patch_size[0] * patch_size[1] * out_channels,
+#             rngs=rngs,
+#             kernel_init=zero_init,
+#             bias_init=zero_init,
+#         )
 
-        self.adaln_linear = nnx.Linear(
-            hidden_size,
-            2 * hidden_size,
-            rngs=rngs,
-            bias_init=zero_init,
-            kernel_init=zero_init,
-        )
+#         self.adaln_linear = nnx.Linear(
+#             hidden_size,
+#             2 * hidden_size,
+#             rngs=rngs,
+#             bias_init=zero_init,
+#             kernel_init=zero_init,
+#         )
 
-    def __call__(self, x_input: Array, cond: Array):
-        linear_cond = nnx.silu(self.adaln_linear(cond))
-        shift, scale = jnp.array_split(linear_cond, 2, axis=-1)
+# def __call__(self, x_input: Array, cond: Array):
+#     linear_cond = nnx.silu(self.adaln_linear(cond))
+#     shift, scale = jnp.array_split(linear_cond, 2, axis=-1)
 
-        x = modulate(self.norm_final(x_input), shift, scale)
-        x = self.linear(x)
+#     x = modulate(self.norm_final(x_input), shift, scale)
+#     x = self.linear(x)
 
-        return x
+#     return x
 
 
 class TransformerBackbone(nnx.Module):
@@ -555,24 +472,25 @@ class TransformerBackbone(nnx.Module):
             kernel_init=xavier_init,
         )
 
-        # # Define scaling ranges for m_f and m_a
-        mf_min, mf_max = 0.5, 4.0
-        ma_min, ma_max = 0.5, 1.0
+        # # # Define scaling ranges for m_f and m_a
+        # mf_min, mf_max = 0.5, 4.0
+        # ma_min, ma_max = 0.5, 1.0
 
-        self.layers = []
+        self.layers = [DiTBlock(embed_dim, num_heads, drop=0.0) for _ in range(num_layers)]
 
-        for v in tqdm(range(num_layers)):
-            # # Calculate scaling factors for the v-th layer using linear interpolation
-            mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
-            ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
 
-            # # Scale the dimensions according to the scaling factors
-            scaled_mlp_dim = int(mlp_dim * mf)
-            scaled_num_heads = max(1, int(num_heads * ma))
-            scaled_num_heads = self._nearest_divisor(scaled_num_heads, embed_dim)
-            mlp_ratio = scaled_mlp_dim / embed_dim
+        # for v in tqdm(range(num_layers)):
+        #     # # Calculate scaling factors for the v-th layer using linear interpolation
+        #     mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
+        #     ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
 
-            self.layers.append(DiTBlock(embed_dim, scaled_num_heads, mlp_ratio))
+        #     # # Scale the dimensions according to the scaling factors
+        #     scaled_mlp_dim = int(mlp_dim * mf)
+        #     scaled_num_heads = max(1, int(num_heads * ma))
+        #     scaled_num_heads = self._nearest_divisor(scaled_num_heads, embed_dim)
+        #     mlp_ratio = scaled_mlp_dim / embed_dim
+
+        #     self.layers.append(DiTBlock(embed_dim, scaled_num_heads, mlp_ratio))
 
         self.output_layer = nnx.Linear(
             embed_dim,
@@ -581,14 +499,6 @@ class TransformerBackbone(nnx.Module):
             bias_init=zero_init,
             kernel_init=xavier_init,
         )
-
-    def _nearest_divisor(self, scaled_num_heads, embed_dim):
-        # Find all divisors of embed_dim
-        divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
-        # Find the nearest divisor
-        nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-
-        return nearest
 
     def __call__(self, x, c_emb):
         x = self.input_embedding(x)
@@ -607,13 +517,16 @@ class PatchMixer(nnx.Module):
     def __init__(self, embed_dim, attn_heads, n_layers=2):
         super().__init__()
         self.layers = [
-            TransformerEncoderBlock(embed_dim, attn_heads) for _ in range(n_layers)
+            DiTBlock(embed_dim, attn_heads, drop=0.0) for _ in range(n_layers)
         ]
+        # [
+        #     TransformerEncoderBlock(embed_dim, attn_heads) for _ in range(n_layers)
+        # ]
 
-    def __call__(self, x: Array) -> Array:
+    def __call__(self, x: Array, c: Array) -> Array:
         for layer in self.layers:
-            x = layer(x)
-            
+            x = layer(x, c)
+
         return x
 
 
@@ -628,7 +541,7 @@ class MicroDiT(nnx.Module):
         embed_dim=1024,
         num_layers=12,
         attn_heads=16,
-        dropout=0.1,
+        dropout=0.0,
         patchmix_layers=4,
         rngs=rngs,
         num_classes=1000,
@@ -638,7 +551,9 @@ class MicroDiT(nnx.Module):
         self.embed_dim = embed_dim
 
         self.patch_embedder = PatchEmbed(
-            patch_size=patch_size[0], in_channels=in_channels, dim=embed_dim
+            patch_size=patch_size[0], 
+            in_channels=in_channels,
+            dim=embed_dim
         )
 
         self.num_patches = self.patch_embedder.num_patches
@@ -653,20 +568,14 @@ class MicroDiT(nnx.Module):
         #     in_features=embed_dim,
         #     kernel_init=xavier_init,
         #     rngs=rngs,
-        #     decode=False
+        #     decode=False,
+        #     out_bias_init=zero_init,
+        #     out_kernel_init=xavier_init,
         # )  # CrossAttention(attn_heads, embed_dim, cond_embed_dim, rngs=rngs)
         self.cond_mlp = MLP(embed_dim, mlp_ratio=4)
 
         # pooling layer
-        # self.pool_mlp = PoolMLP(embed_dim)
-
-        self.linear = nnx.Linear(
-            self.embed_dim,
-            self.embed_dim,
-            rngs=rngs,
-            bias_init=zero_init,
-            kernel_init=xavier_init,
-        )
+        self.pool_mlp = PoolMLP(embed_dim)
 
         self.patch_mixer = PatchMixer(embed_dim, attn_heads, patchmix_layers)
 
@@ -686,7 +595,8 @@ class MicroDiT(nnx.Module):
             kernel_init=zero_init,
             bias_init=zero_init,
         )
-#FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
+
+        # self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
     def _unpatchify(self, x, patch_size=(2, 2), height=32, width=32):
         bs, num_patches, patch_dim = x.shape
@@ -700,10 +610,12 @@ class MicroDiT(nnx.Module):
 
         # transpose x to (bs, num_patches_h, H, num_patches_w, W, in_channels)
         x = x.transpose(0, 1, 3, 2, 4, 5)
+
         # Reshape x to (bs, height, width, in_channels)
         reconstructed = x.reshape((bs, height, width, in_channels))
-        return reconstructed
 
+        return reconstructed
+    
     def __call__(
         self, x: Array, t: Array, y_cap: Array, mask: Array = None, train=False
     ):
@@ -735,22 +647,27 @@ class MicroDiT(nnx.Module):
         time_embed = self.time_embedder(t)
         # time_embed_unsqueeze = jnp.expand_dims(time_embed, axis=1)
 
-        # mha_out = self.cond_attention(time_embed_unsqueeze, cond_embed_unsqueeze)
+        # mha_out = self.cond_attention(time_embed_unsqueeze, label_embed_unsqueeze)
         # mha_out = mha_out.squeeze(1)
         cond_ty = (time_embed + label_embed).astype(x.dtype)
         mlp_cond = self.cond_mlp(cond_ty)
-        # pooling the conditions
-        # pool_out = self.pool_mlp(jnp.expand_dims(mlp_cond, axis=2))
+        # # pooling the conditions
+        # cond_signal = jnp.expand_dims(cond_ty, axis=1)
+        # cond_signal = jnp.broadcast_to(cond_signal, shape=(x.shape))
+        # x = x + cond_signal
+        
+        pool_out = self.pool_mlp(jnp.expand_dims(mlp_cond, axis=2))
+        pool_out = jnp.expand_dims((pool_out + time_embed), axis=1)
+        # # print(f"pool_out = {pool_out.shape}")
 
-        # pool_out = jnp.expand_dims((pool_out + time_embed), axis=1)
-
-        cond_signal = jnp.expand_dims(self.linear(mlp_cond), axis=1)
+        cond_signal = jnp.expand_dims(mlp_cond, axis=1)
         cond_signal = jnp.broadcast_to(cond_signal, shape=(x.shape))
-        # print(f'{mlp_cond.shape = } / {cond_signal.shape = }')
+        # print(f'/ {cond_signal.shape = } ')
         # self.log_activation_stats("cond_signal", cond_signal)
 
         x = x + cond_signal
-        x = self.patch_mixer(x)
+        x = self.patch_mixer(x, cond_ty)
+        # print(f'x patchmixed {x.shape}')
         # self.log_activation_stats("patch_mixer", x)
 
         if mask is not None:
@@ -758,14 +675,15 @@ class MicroDiT(nnx.Module):
             # print(f'{mask.shape = } / x masked {x.shape}')
             # self.log_activation_stats("masked", x)
 
-        # mlp_out_us = jnp.expand_dims(mlp_cond, axis=1)
+        mlp_out_us = jnp.expand_dims(mlp_cond, axis=1)
+        # print(f'{mlp_out_us.shape = }')
+        cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
+        # cond_signal = jnp.expand_dims(cond, axis=-1)
 
-        # cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
-
-        x = x + cond_signal
+        x = x + cond#_signal #.expand_dims(axis=1)
 
         # print(f'x masked / {x.shape}')
-        x = self.backbone(x, label_embed)
+        x = self.backbone(x, cond_ty)
         # self.log_activation_stats("transformer_backbone", x)
 
         x = self.final_linear(x)
@@ -792,7 +710,7 @@ class MicroDiT(nnx.Module):
             std_val=std_val,
         )
 
-    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=3.0):
+    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=2.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
 
@@ -822,9 +740,11 @@ class RectFlowWrapper(nnx.Module):
         self.model = model
         self.sigln = sigln
 
-    def __call__(self, x_input: Array, cond: Array, mask):
+    def __call__(self, x_input: Array, cond: Array, mask=None):
         b_size = x_input.shape[0]  # batch_size
-        mask = mask.astype(jnp.bfloat16)
+        
+        if mask is not None:
+            mask = mask.astype(jnp.bfloat16)
 
         rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
@@ -844,19 +764,20 @@ class RectFlowWrapper(nnx.Module):
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
 
-        x_input = apply_mask(x_input, mask, config.patch_size)
-        v_thetha = apply_mask(v_thetha, mask, config.patch_size)
-        z_noise = apply_mask(z_noise, mask, config.patch_size)
+        if mask is not None:
+            x_input = apply_mask(x_input, mask, config.patch_size)
+            v_thetha = apply_mask(v_thetha, mask, config.patch_size)
+            z_noise = apply_mask(z_noise, mask, config.patch_size)
 
         mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
         batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
 
         loss = jnp.mean(batchwise_mse_loss)
-        loss = loss * 1 / (1 - config.mask_ratio)
+        loss = loss# * 1 / (1 - config.mask_ratio)
 
         return v_thetha, loss
 
-    def sample(self, cond, sample_steps=50, cfg=3.0):
+    def sample(self, cond, sample_steps=50, cfg=2.0):
         z_latent = jrand.normal(randkey, (len(cond), 32, 32, 4))  # noise
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
