@@ -119,25 +119,53 @@ def get_mask(
 
 
 def mask_out_token(x: jnp.ndarray, ids_keep: jnp.ndarray) -> jnp.ndarray:
-    """Mask out tokens specified by ids_keep."""
+    """Mask out tokens specified by ids_keep using lax.gather."""
+
     N, L, D = x.shape  # batch, length, dim
-    # Expand ids_keep to have the same number of dimensions as x
-    ids_keep_expanded = jnp.expand_dims(ids_keep, axis=-1)
-    ids_keep_expanded = jnp.tile(ids_keep_expanded, (1, 1, D))
-    x_masked = jnp.take_along_axis(x, ids_keep_expanded, axis=1)
+    N_keep, K = ids_keep.shape  # batch, number of tokens to keep
+
+    # Create index arrays
+    batch_indices = jnp.arange(N)[:, None, None]  # Shape (N, 1, 1)
+    keep_indices = ids_keep[:, :, None]  # Shape (N, K, 1)
+    dim_indices = jnp.arange(D)[None, None, :]  # Shape (1, 1, D)
+
+    # Broadcast the index arrays to the desired output shape (N, K, D)
+    batch_indices = jnp.broadcast_to(batch_indices, (N, K, D))
+    keep_indices = jnp.broadcast_to(keep_indices, (N, K, D))
+    dim_indices = jnp.broadcast_to(dim_indices, (N, K, D))
+
+    # Use advanced indexing to gather the desired tokens
+    x_masked = x[batch_indices, keep_indices, dim_indices]
+    # print(f'x masked {x.shape}')
+
     return x_masked
 
 
-def unmask_tokens(
-    x: jnp.ndarray, ids_restore: jnp.ndarray, mask_token: jnp.ndarray
-) -> jnp.ndarray:
-    """Unmask tokens using provided mask token."""
-    mask_tokens = jnp.tile(
-        mask_token, (x.shape[0], ids_restore.shape[1] - x.shape[1], 1)
-    )
+def unmask_tokens(x: jnp.ndarray, ids_restore: jnp.ndarray, mask_token) -> jnp.ndarray:
+    """Unmask tokens using provided mask token with take_along_axis."""
+    # Repeat mask token for batch size and missing tokens
+    N, L_masked, D = x.shape
+    L_original = ids_restore.shape[1]
+
+    # Repeat mask token for batch size and missing tokens
+    num_missing = L_original - L_masked
+    mask_tokens = jnp.tile(mask_token, (N, num_missing, 1))
+
+    # Concatenate original tokens with mask tokens
     x_ = jnp.concatenate([x, mask_tokens], axis=1)
-    # Expand ids_restore to have the same number of dimensions as x_
-    ids_restore_expanded = jnp.expand_dims(ids_restore, axis=-1)
-    ids_restore_expanded = jnp.tile(ids_restore_expanded, (1, 1, x_.shape[2]))
-    x_ = jnp.take_along_axis(x_, ids_restore_expanded, axis=1, mode='clip')  # unshuffle
-    return x_
+
+    # Create index arrays
+    batch_indices = jnp.arange(N)[:, None, None]  # (N, 1, 1)
+    seq_indices = ids_restore[:, :, None]  # (N, L_original, 1)
+    depth_indices = jnp.arange(D)[None, None, :]  # (1, 1, D)
+
+    # Broadcast indices to the desired output shape (N, L_original, D)
+    batch_indices = jnp.broadcast_to(batch_indices, (N, L_original, D))
+    seq_indices = jnp.broadcast_to(seq_indices, (N, L_original, D))
+    depth_indices = jnp.broadcast_to(depth_indices, (N, L_original, D))
+
+    # Use advanced indexing to gather and reorder
+    x_unmasked = x_[batch_indices, seq_indices, depth_indices]
+    # print(f'{x_unmasked.shape = }')
+
+    return x_unmasked
