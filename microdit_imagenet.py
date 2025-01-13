@@ -7,7 +7,7 @@ from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
 
-# jax.config.update("jax_default_matmul_precision", "bfloat16")
+jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 import numpy as np
 from flax import nnx
@@ -27,7 +27,7 @@ from diffusers.image_processor import VaeImageProcessor
 from streaming.base.format.mds.encodings import Encoding, _encodings
 from streaming import StreamingDataset
 
-from m2 import RectFlowWrapper, MicroDiT, random_mask
+from m2 import RectFlowWrapper, MicroDiT, random_mask, get_mask
 
 import warnings
 
@@ -39,11 +39,11 @@ class config:
     img_size = 32
     seed = 42
     patch_size = (2, 2)
-    lr = 1e-4
+    lr = 1e-3
     mask_ratio = 0.75
     epochs = 30
     data_split = 10_000  # imagenet split to train on
-    cfg_scale = 3.0
+    cfg_scale = 2.0
     vaescale_factor = 0.13025
 
 
@@ -52,12 +52,13 @@ JAX_TRACEBACK_FILTERING = "off"
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 os.environ["XLA_PYTHON_CLIENT_ALLOCATOR"] = "platform"
 XLA_PYTHON_CLIENT_MEM_FRACTION = 0.20
-# JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
+JAX_DEFAULT_MATMUL_PRECISION = "bfloat16"
 
 # keys/env seeds
 rkey = jrand.key(config.seed)
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
+
 
 # mesh / sharding configs
 num_devices = jax.device_count()
@@ -96,7 +97,7 @@ local_train_dir = "./imagenet"  # just a local mirror path
 
 def jax_collate(batch):
     latents = jnp.stack(
-        [jnp.array(item["vae_output"], dtype=jnp.float32) for item in batch], axis=0
+        [jnp.array(item["vae_output"], dtype=jnp.bfloat16) for item in batch], axis=0
     )
     labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
 
@@ -132,7 +133,7 @@ def sample_image_batch(step, model, labels):
     file = f"mdsamples/{step}_microdit.png"
     batch = [process_img(x) for x in image_batch]
 
-    gridfile = image_grid(batch[:16], file)
+    gridfile = image_grid(batch, file)
     print(f"sample saved @ {gridfile}")
     del pred_model
 
@@ -156,7 +157,7 @@ def process_img(img):
     return img
 
 
-def image_grid(pil_images, file, grid_size=(4, 4), figsize=(20, 20)):
+def image_grid(pil_images, file, grid_size=(3, 3), figsize=(10, 10)):
     rows, cols = grid_size
     assert len(pil_images) <= rows * cols, "Grid size must accommodate all images."
 
@@ -177,6 +178,16 @@ def image_grid(pil_images, file, grid_size=(4, 4), figsize=(20, 20)):
     plt.show()
 
     return file
+
+
+def inspect_latents(batch):
+    batch = rearrange(batch, "b c h w -> b h w c")
+    print(batch.shape)
+    # img_latents = img_latents / config.vaescale_factor
+    batch = [process_img(x) for x in batch]
+    file = f"images/imagenet_b9.jpg"
+    gridfile = image_grid(batch, file)
+    print(f"sample saved @ {gridfile}")
 
 
 # save model params in pickle file
@@ -212,30 +223,29 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
         img_latents, label = batch["vae_output"], batch["label"]
-        input_mean = jnp.mean(img_latents)
-        input_std = jnp.std(img_latents)
+        # input_mean = jnp.mean(img_latents)
+        # input_std = jnp.std(img_latents)
 
-        # jax.debug.print({"input/mean": input_mean, "input/std": input_std})
-        normalized_latents = (img_latents - input_mean) / (input_std + 1e-8)
+        # # jax.debug.print({"input/mean": input_mean, "input/std": input_std})
+        # normalized_latents = (img_latents - input_mean) / (input_std + 1e-8)
 
-        # Use normalized_latents as the input to your model
-        img_latents = normalized_latents
+        # # Use normalized_latents as the input to your model
+        # img_latents = normalized_latents
         img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
         img_latents = rearrange(img_latents, "b c h w -> b h w c")
         # print(f"latents => {img_latents.shape}")
-
         img_latents, label = jax.device_put((img_latents, label), data_sharding)
 
-        bs, height, width, channels = img_latents.shape
+        # bs, height, width, channels = img_latents.shape
 
-        mask = random_mask(
-            bs,
-            height,
-            width,
-            patch_size=config.patch_size,
-            mask_ratio=config.mask_ratio,
-        )
-        v_thetha, loss = model(img_latents, label, mask)
+        # mask = random_mask(
+        #     bs,
+        #     height,
+        #     width,
+        #     patch_size=config.patch_size,
+        #     mask_ratio=config.mask_ratio,
+        # )
+        v_thetha, loss = model(img_latents, label, mask_ratio=config.mask_ratio)
 
         return loss
 
@@ -243,8 +253,9 @@ def train_step(model, optimizer, batch):
     loss, grads = gradfn(model, batch)
     # print(f'{grads.shape = }')
     # grads = optax.per_example_global_norm_clip(grads, 1.0)
-    optimizer.update(grads)
     grad_norm = optax.global_norm(grads)
+
+    optimizer.update(grads)
 
     return loss, grad_norm
 
@@ -258,7 +269,6 @@ def trainer(epochs, model, optimizer, train_loader):
     #     key="",
     #     project_name="microdit",
     # )
-
     stime = time.time()
     sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
 
@@ -313,20 +323,16 @@ def overfit(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     model.train()
 
-    # wandb_logger(
-    #     key="", project_name="microdit_overfit"
-    # )
+    wandb_logger(
+        key="3aef5402e364c9da47508adf8be0664512ed30b2", project_name="microdit_overfit"
+    )
 
     stime = time.time()
 
     batch = next(iter(train_loader))
-    # print('initial sample..')
-    # gridfile = sample_image_batch('initial', model, batch['label'])
-    img_latents = batch["vae_output"]
-    input_mean = jnp.mean(img_latents)
-    input_std = jnp.std(img_latents)
 
-    print({"input/mean": input_mean.item(), "input/std": input_std.item()})
+    # print("initial sample..")
+    # gridfile = sample_image_batch("initial", model, batch["label"])
 
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
@@ -335,36 +341,19 @@ def overfit(epochs, model, optimizer, train_loader):
             f"step {epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm.item()}"
         )
 
-        # wandb.log({
-        #     "loss": train_loss.item(),
-        #     "log_loss": math.log10(train_loss.item()),
-        #     "grad_norm": grad_norm.item(),
-        #     "log_grad_norm": math.log10(grad_norm.item() + 1e-8) or 0.0,
-        # })
+        wandb.log(
+            {
+                "loss": train_loss.item(),
+                "log_loss": math.log10(train_loss.item() + 1e-8),
+                "grad_norm": grad_norm.item(),
+                "log_grad_norm": math.log10(grad_norm.item() + 1e-8),
+            }
+        )
 
-        if epoch % 50 == 0:
+        if epoch % 25 == 0:
             gridfile = sample_image_batch(epoch, model, batch["label"])
             image_log = wandb.Image(gridfile)
-            # wandb.log({"image_sample": image_log})
-
-        # if epoch % 50 == 0:  # Log less frequently
-        #     state = nnx.state(model)
-        #     weight_stats = {}
-        #     for (
-        #         layer_name,
-        #         layer_params,
-        #     ) in state.items():  # Assuming model is accessible here
-        #         for param_name, param_value in layer_params.items():
-        #             # print(f'param-name {param_name} / param {param_value}')
-        #             for name, layer_value in param_value.items():
-        #                 if name=="kernel" or name=="bias":
-        #                     print(f"param_name {layer_name}/{param_name}/{name}")
-        #                     weight_stats[f"{layer_name}/{param_name}/{name}/mean"] = jnp.mean(layer_value.value).item()
-        #                     weight_stats[f"{layer_name}/{param_name}/{name}/std"] = jnp.std(layer_value.value).item()
-
-        #     print(f'weight stats \n {weight_stats}')
-
-        #     wandb.log(weight_stats)
+            wandb.log({"image_sample": image_log})
 
         jax.clear_caches()
         gc.collect()
@@ -404,6 +393,7 @@ def main(run, epochs, batch_size):
         split=None,
         batch_size=batch_size,
     )
+
     train_loader = DataLoader(
         dataset[: config.data_split],
         batch_size=batch_size,
@@ -420,10 +410,10 @@ def main(run, epochs, batch_size):
     microdit = MicroDiT(
         in_channels=4,
         patch_size=(2, 2),
-        embed_dim=768,
-        num_layers=12,
+        embed_dim=1152,
+        num_layers=4,
         attn_heads=12,
-        patchmix_layers=6,
+        patchmix_layers=2,
     )
 
     rf_engine = RectFlowWrapper(microdit)
@@ -432,87 +422,15 @@ def main(run, epochs, batch_size):
     n_params = sum([p.size for p in jax.tree.leaves(state)])
     print(f"model parameters count: {n_params/1e6:.2f}M")
 
-    # tx = optax.chain(
-    #     optax.clip_by_global_norm(5.0),
-    #     optax.adamw(learning_rate=1e-4, b1=0.9, b2=0.99, weight_decay=0.1),
-    # )
     optimizer = nnx.Optimizer(
         rf_engine,
-        # optax.chain(
-        #     optax.clip(max_delta=1.0), # Set your desired clipping range
-        #     # optax.clip_by_global_norm(1.0),
-        #     optax.adamw(learning_rate=1e-4, b1=0.9, b2=0.995, weight_decay=0.01),
-        # )
-        optax.adamw(learning_rate=1e-5, b1=0.9, b2=0.99, weight_decay=0.1),
+        optax.adamw(learning_rate=2e-4),
     )
 
     # replicate model across devices
     state = nnx.state((rf_engine, optimizer))
     state = jax.device_put(state, rep_sharding)
     nnx.update((rf_engine, optimizer), state)
-
-    batch = next(iter(train_loader))
-    # print('initial sample..')
-    # gridfile = sample_image_batch('initial', model, batch['label'])
-    img_latents = batch["vae_output"]
-    input_mean = jnp.mean(img_latents)
-    input_std = jnp.std(img_latents)
-
-    print({"input/mean": input_mean.item(), "input/std": input_std.item()})
-    normalized_latents = (img_latents - input_mean) / (input_std + 1e-8)
-
-    # Use normalized_latents as the input to your model
-    img_latents_for_model = normalized_latents
-
-    # Log normalized input statistics (optional but good for verification)
-    normalized_input_mean = jnp.mean(img_latents_for_model)
-    normalized_input_std = jnp.std(img_latents_for_model)
-    print(
-        {
-            "input/normalized_mean": normalized_input_mean.item(),
-            "input/normalized_std": normalized_input_std.item(),
-        }
-    )
-
-    # mstate = jax.device_get(nnx.state(rf_engine))
-
-    # weight_stats = {}
-
-    # wandb_logger(
-    #     key="3aef5402e364c9da47508adf8be0664512ed30b2", project_name="microdit_overfit"
-    # )
-    # print("\n--- Using tree_flatten ---")
-    # flattened_params, treedef = jax.tree_flatten(state)
-
-    # for i, param in enumerate(flattened_params):
-    #     path = ".".join(treedef.unflatten(jnp.zeros_like(param))._paths[i])
-    #     print(f"Parameter: {path}, Shape: {param.shape}, dtype: {param.dtype}")
-
-    # print('log state values..')
-
-    # # params = nnx.state(rf_engine)  # Get the model's state pytree
-    # model_stats = get_model_stats(mstate)
-    # print_stats(model_stats)
-
-    # jax.tree_map(log_state_values, state)
-
-    # print('logged..')
-    # for (
-    #     layer_name,
-    #     layer_params,
-    # ) in state.items():  # Assuming model is accessible here
-    #     for param_name, param_value in layer_params.items():
-    #         # print(f'param-name {param_name} / param {param_value}')
-    #         for name, layer_value in param_value.items():
-    #             if name=="kernel" or name=="bias":
-    #                 print(f"param_name {layer_name}/{param_name}/{name}")
-    #                 weight_stats[f"{layer_name}/{param_name}/{name}/mean"] = jnp.mean(layer_value.value).item()
-    #                 weight_stats[f"{layer_name}/{param_name}/{name}/std"] = jnp.std(layer_value.value).item()
-
-    # print(f'weight stats \n {weight_stats}')
-
-    # wandb.log(weight_stats)
-    # wandb.log({"input/mean": input_mean.item(), "input/std": input_std.item()})
 
     if run == "overfit":
         model, loss = overfit(epochs, rf_engine, optimizer, train_loader)
