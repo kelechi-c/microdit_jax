@@ -137,7 +137,7 @@ def remove_masked_patches(patches: Array, mask: Array) -> Array:
     # return unmasked_patches
 
 
-def add_masked_patches(patches: np.ndarray, mask: np.ndarray, og_shape=(8, 256, 1152)) -> np.ndarray:
+def add_masked_patches(patches: np.ndarray, mask: np.ndarray) -> np.ndarray:
     """
     Adds the masked patches to the patches tensor.
     Returned tensor will have shape (bs, num_patches, embed_dim).
@@ -500,6 +500,14 @@ class TransformerBackbone(nnx.Module):
             kernel_init=xavier_init,
         )
 
+    # def _nearest_divisor(self, scaled_num_heads, embed_dim):
+    #     # Find all divisors of embed_dim
+    #     divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
+    #     # Find the nearest divisor
+    #     nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
+
+    #     return nearest
+
     def __call__(self, x, c_emb):
         x = self.input_embedding(x)
         class_emb = self.class_embedding(c_emb)
@@ -528,6 +536,92 @@ class PatchMixer(nnx.Module):
             x = layer(x, c)
 
         return x
+
+
+from typing import Dict
+from functools import partial
+
+
+def get_mask(
+    batch: int,
+    length: int,
+    mask_ratio: float,
+    key=randkey,
+) -> Dict[str, jnp.ndarray]:
+    """Get binary mask for input sequence.
+
+    mask: binary mask, 0 is keep, 1 is remove
+    ids_keep: indices of tokens to keep
+    ids_restore: indices to restore the original order
+    """
+    len_keep = int(length * (1 - mask_ratio))
+    key, subkey = jax.random.split(key)
+    noise = jax.random.uniform(subkey, shape=(batch, length))  # noise in [0, 1]
+    ids_shuffle = jnp.argsort(noise, axis=1)  # ascend: small is keep, large is remove
+    ids_restore = jnp.argsort(ids_shuffle, axis=1)
+    # keep the first subset
+    ids_keep = jnp.sort(ids_shuffle[:, :len_keep], axis=1)  # Ensure ids_keep is sorted
+    return {
+        # "mask": mask,
+        "ids_keep": ids_keep,
+        "ids_restore": ids_restore
+    }
+
+
+
+def mask_out_token(x: jnp.ndarray, ids_keep: jnp.ndarray) -> jnp.ndarray:
+    """Mask out tokens specified by ids_keep using lax.gather."""
+
+    N, L, D = x.shape  # batch, length, dim
+    N_keep, K = ids_keep.shape # batch, number of tokens to keep
+
+    # Create index arrays
+    batch_indices = jnp.arange(N)[:, None, None]  # Shape (N, 1, 1)
+    keep_indices = ids_keep[:, :, None]          # Shape (N, K, 1)
+    dim_indices = jnp.arange(D)[None, None, :]   # Shape (1, 1, D)
+
+    # Broadcast the index arrays to the desired output shape (N, K, D)
+    batch_indices = jnp.broadcast_to(batch_indices, (N, K, D))
+    keep_indices = jnp.broadcast_to(keep_indices, (N, K, D))
+    dim_indices = jnp.broadcast_to(dim_indices, (N, K, D))
+
+    # Use advanced indexing to gather the desired tokens
+    x_masked = x[batch_indices, keep_indices, dim_indices]
+    # print(f'x masked {x.shape}')
+
+    return x_masked
+
+
+def unmask_tokens(
+    x: jnp.ndarray, ids_restore: jnp.ndarray, mask_token
+) -> jnp.ndarray:
+    """Unmask tokens using provided mask token with take_along_axis."""
+    # Repeat mask token for batch size and missing tokens
+    N, L_masked, D = x.shape
+    L_original = ids_restore.shape[1]
+
+    # Repeat mask token for batch size and missing tokens
+    num_missing = L_original - L_masked
+    mask_tokens = jnp.tile(mask_token, (N, num_missing, 1))
+
+    # Concatenate original tokens with mask tokens
+    x_ = jnp.concatenate([x, mask_tokens], axis=1)
+
+    # Create index arrays
+    batch_indices = jnp.arange(N)[:, None, None]  # (N, 1, 1)
+    seq_indices = ids_restore[:, :, None]         # (N, L_original, 1)
+    depth_indices = jnp.arange(D)[None, None, :]  # (1, 1, D)
+
+    # Broadcast indices to the desired output shape (N, L_original, D)
+    batch_indices = jnp.broadcast_to(batch_indices, (N, L_original, D))
+    seq_indices = jnp.broadcast_to(seq_indices, (N, L_original, D))
+    depth_indices = jnp.broadcast_to(depth_indices, (N, L_original, D))
+
+    # Use advanced indexing to gather and reorder
+    x_unmasked = x_[batch_indices, seq_indices, depth_indices]
+    # print(f'{x_unmasked.shape = }')
+
+    return x_unmasked
 
 
 #####################
@@ -577,6 +671,18 @@ class MicroDiT(nnx.Module):
         # pooling layer
         self.pool_mlp = PoolMLP(embed_dim)
 
+        # self.linear = nnx.Linear(
+        #     self.embed_dim,
+        #     self.embed_dim,
+        #     rngs=rngs,
+        #     bias_init=zero_init,
+        #     kernel_init=xavier_init,
+        # )
+        mask_token_value = jnp.zeros((1, 1, patch_size[0] * patch_size[1] * in_channels), dtype=jnp.bfloat16)
+        self.mask_token = nnx.Param(mask_token_value)
+
+        jax.lax.stop_gradient(self.mask_token.value)
+
         self.patch_mixer = PatchMixer(embed_dim, attn_heads, patchmix_layers)
 
         self.backbone = TransformerBackbone(
@@ -615,14 +721,15 @@ class MicroDiT(nnx.Module):
         reconstructed = x.reshape((bs, height, width, in_channels))
 
         return reconstructed
-    
+
     def __call__(
-        self, x: Array, t: Array, y_cap: Array, mask: Array = None, train=False
+        self, x: Array, t: Array, y_cap: Array, 
+        mask_ratio = 0.0, train=False
     ):
         bsize, height, width, channels = x.shape
         x = self.patch_embedder(x)
         # self.log_activation_stats("patch_embedder", x)
-
+        
         pos_embed = get_2d_sincos_pos_embed(
             embed_dim=self.embed_dim, length=self.num_patches
         )
@@ -652,10 +759,10 @@ class MicroDiT(nnx.Module):
         cond_ty = (time_embed + label_embed).astype(x.dtype)
         mlp_cond = self.cond_mlp(cond_ty)
         # # pooling the conditions
-        # cond_signal = jnp.expand_dims(cond_ty, axis=1)
-        # cond_signal = jnp.broadcast_to(cond_signal, shape=(x.shape))
-        # x = x + cond_signal
-        
+        cond_signal = jnp.expand_dims(cond_ty, axis=1)
+        cond_signal = jnp.broadcast_to(cond_signal, shape=(x.shape))
+        x = x + cond_signal
+
         pool_out = self.pool_mlp(jnp.expand_dims(mlp_cond, axis=2))
         pool_out = jnp.expand_dims((pool_out + time_embed), axis=1)
         # # print(f"pool_out = {pool_out.shape}")
@@ -670,17 +777,25 @@ class MicroDiT(nnx.Module):
         # print(f'x patchmixed {x.shape}')
         # self.log_activation_stats("patch_mixer", x)
 
-        if mask is not None:
-            x = remove_masked_patches(x, mask)
-            # print(f'{mask.shape = } / x masked {x.shape}')
+        if mask_ratio > 0:
+            # mask_dict = mask
+            mask_dict = get_mask(x.shape[0], x.shape[1], mask_ratio=mask_ratio)
+            
+            ids_keep = mask_dict["ids_keep"]
+            ids_restore = mask_dict["ids_restore"]
+            # mask = mask_dict["mask"]
+
+            x = mask_out_token(x, ids_keep)
+            # x = remove_masked_patches(x, mask)
+            # print(f' / x masked {x.shape}')
             # self.log_activation_stats("masked", x)
 
         mlp_out_us = jnp.expand_dims(mlp_cond, axis=1)
         # print(f'{mlp_out_us.shape = }')
         cond = jnp.broadcast_to((mlp_out_us + pool_out), shape=(x.shape))
         # cond_signal = jnp.expand_dims(cond, axis=-1)
-
-        x = x + cond#_signal #.expand_dims(axis=1)
+        # print(f'{cond.shape = }')
+        x = x + cond  # _signal #.expand_dims(axis=1)
 
         # print(f'x masked / {x.shape}')
         x = self.backbone(x, cond_ty)
@@ -688,13 +803,16 @@ class MicroDiT(nnx.Module):
 
         x = self.final_linear(x)
         # self.log_activation_stats("final_layer", x)
-
+        # print(f'final linear {x.shape}')
         # add back masked patches
-        if mask is not None:
-            x = add_masked_patches(x, mask)
-            # self.log_activation_stats("unmasked", x)
-
+        # if mask is not None:
+        if mask_ratio > 0:
+            # print(f'{self.mask_token.value.shape = }')
+            x = unmask_tokens(x, ids_restore, self.mask_token)
             # print(f'x unmasked / {x.shape}')
+
+            # x = add_masked_patches(x, mask)
+            # self.log_activation_stats("unmasked", x)
 
         x = self._unpatchify(x)
 
@@ -740,11 +858,11 @@ class RectFlowWrapper(nnx.Module):
         self.model = model
         self.sigln = sigln
 
-    def __call__(self, x_input: Array, cond: Array, mask=None):
+    def __call__(self, x_input: Array, cond: Array, mask_ratio=config.mask_ratio):
         b_size = x_input.shape[0]  # batch_size
         
-        if mask is not None:
-            mask = mask.astype(jnp.bfloat16)
+        # if mask is not None:
+        #     mask = mask.astype(jnp.bfloat16)
 
         rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
@@ -757,23 +875,23 @@ class RectFlowWrapper(nnx.Module):
         )  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
-        v_thetha = self.model(z_noise_t, rand_t, cond, mask, train=True)
+        v_thetha = self.model(z_noise_t, rand_t, cond, mask_ratio=mask_ratio, train=True)
         # print(f'{v_thetha.shape = }')
 
         mean_dim = list(
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
 
-        if mask is not None:
-            x_input = apply_mask(x_input, mask, config.patch_size)
-            v_thetha = apply_mask(v_thetha, mask, config.patch_size)
-            z_noise = apply_mask(z_noise, mask, config.patch_size)
+        # if mask is not None:
+        #     x_input = apply_mask(x_input, mask, config.patch_size)
+        #     v_thetha = apply_mask(v_thetha, mask, config.patch_size)
+        #     z_noise = apply_mask(z_noise, mask, config.patch_size)
 
         mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
         batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
 
         loss = jnp.mean(batchwise_mse_loss)
-        loss = loss# * 1 / (1 - config.mask_ratio)
+        loss = loss * 1 / (1 - mask_ratio)
 
         return v_thetha, loss
 
@@ -791,7 +909,7 @@ class RectFlowWrapper(nnx.Module):
             t = step / sample_steps
             t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
 
-            vcond = self.model(z_latent, t, cond, None)
+            vcond = self.model(z_latent, t, cond, mask_ratio=0.0)
             null_cond = jnp.zeros_like(cond)
             v_uncond = self.model(z_latent, t, null_cond)  # type: ignore
             vcond = v_uncond + cfg * (vcond - v_uncond)

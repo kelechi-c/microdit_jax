@@ -265,10 +265,11 @@ def trainer(epochs, model, optimizer, train_loader):
 
     model.train()
 
-    # wandb_logger(
-    #     key="",
-    #     project_name="microdit",
-    # )
+    wandb_logger(
+        key="",
+        project_name="microdit",
+    )
+    
     stime = time.time()
     sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
 
@@ -280,14 +281,14 @@ def trainer(epochs, model, optimizer, train_loader):
                 f"step {step}/{len(train_loader)}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
             )
 
-            # wandb.log(
-            #     {
-            #         "loss": train_loss.item(),
-            #         "log_loss": math.log10(train_loss.item()),
-            #         "grad_norm": grad_norm,
-            #         "log_grad_norm": math.log10(grad_norm + 1e-8),
-            #     }
-            # )
+            wandb.log(
+                {
+                    "loss": train_loss.item(),
+                    "log_loss": math.log10(train_loss.item()),
+                    "grad_norm": grad_norm,
+                    "log_grad_norm": math.log10(grad_norm + 1e-8),
+                }
+            )
 
             if step % 500 == 0:
                 gridfile = sample_image_batch(step, model, sample_labels)
@@ -324,7 +325,7 @@ def overfit(epochs, model, optimizer, train_loader):
     model.train()
 
     wandb_logger(
-        key="3aef5402e364c9da47508adf8be0664512ed30b2", project_name="microdit_overfit"
+        key="", project_name="microdit_overfit"
     )
 
     stime = time.time()
