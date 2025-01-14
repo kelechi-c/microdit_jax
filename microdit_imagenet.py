@@ -6,7 +6,7 @@ import jax, optax
 from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
 from jax.experimental import mesh_utils
-
+from jaxlib import xla_client
 jax.config.update("jax_default_matmul_precision", "bfloat16")
 
 import numpy as np
@@ -26,13 +26,15 @@ from diffusers import AutoencoderKL
 from diffusers.image_processor import VaeImageProcessor
 from streaming.base.format.mds.encodings import Encoding, _encodings
 from streaming import StreamingDataset
-
+from datasets import load_dataset, IterableDataset
+import builtins
 from m2 import RectFlowWrapper, MicroDiT, random_mask, get_mask
 
 import warnings
 
 warnings.filterwarnings("ignore")
-
+builtins.bfloat16 = xla_client.bfloat16
+# xla_client.batched_device_put()
 
 class config:
     batch_size = 128
@@ -81,6 +83,86 @@ vae = AutoencoderKL.from_pretrained("stabilityai/sdxl-vae", torch_dtype=torch.fl
 print("loaded vae")
 
 
+class ShapeBatchingDataset(IterableDataset):
+    def __init__(self, batch_size=9, shuffle=False, seed=config.seed, buffer_multiplier=20):
+        self.split_size = 1000
+        self.dataset = load_dataset(
+            "SwayStar123/preprocessed_commoncatalog-cc-by",
+            streaming=True,
+            split="train",
+            trust_remote_code=True,
+        ).take(self.split_size)
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.seed = seed
+        self.buffer_multiplier = buffer_multiplier
+
+    def __iter__(self):
+        # if self.shuffle:
+        #     self.dataset = self.dataset.shuffle(
+        #         seed=self.seed, buffer_size=self.batch_size * self.buffer_multiplier
+        #     )
+
+        shape_batches = defaultdict(list)
+        for sample in self.dataset:
+            # Get the shape as a tuple to use as a key
+            shape_key = tuple(sample["vae_latent_shape"])
+            shape_batches[shape_key].append(sample)
+
+            # If enough samples are accumulated for this shape, yield a batch
+            if len(shape_batches[shape_key]) == self.batch_size:
+                batch = self.prepare_batch(shape_batches[shape_key])
+                yield batch
+                shape_batches[shape_key] = []  # Reset the buffer for this shape
+
+        # After iterating over the dataset, yield any remaining partial batches
+        for remaining_samples in shape_batches.values():
+            if remaining_samples:
+                batch = self.prepare_batch(remaining_samples)
+                yield batch
+
+    def prepare_batch(self, samples):
+        # Convert lists of samples into tensors
+        vae_latent_shape = tuple(samples[0]["vae_latent_shape"])
+
+        batch = {
+            "caption": [s["caption"] for s in samples],
+            "vae_latent": jnp.array(
+                np.stack(
+                    [
+                        np.frombuffer(s["vae_latent"], dtype=np.float32).copy()
+                        for s in samples
+                    ]
+                )
+            ).reshape(-1, *vae_latent_shape),
+            "vae_latent_shape": vae_latent_shape,
+            "text_embedding": jnp.array(
+                np.stack(
+                    [
+                        np.frombuffer(s["text_embedding"], dtype=np.float16).copy()
+                        for s in samples
+                    ]
+                )
+            ),
+        }
+        return batch
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
+
+def jax_collate(batch):
+    latents = jnp.stack(
+        [jnp.array(item["vae_latent"], dtype=jnp.bfloat16) for item in batch], axis=0
+    )
+    labels = jnp.stack([int(item["text_embedding"]) for item in batch], axis=0)
+
+    return {
+        "vae_output": latents,
+        "label": labels,
+    }
+
+
 class uint8(Encoding):
     def encode(self, obj: Any) -> bytes:
         return obj.tobytes()
@@ -95,16 +177,16 @@ remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
 local_train_dir = "./imagenet"  # just a local mirror path
 
 
-def jax_collate(batch):
-    latents = jnp.stack(
-        [jnp.array(item["vae_output"], dtype=jnp.bfloat16) for item in batch], axis=0
-    )
-    labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
+# def jax_collate(batch):
+#     latents = jnp.stack(
+#         [jnp.array(item["vae_output"], dtype=jnp.bfloat16) for item in batch], axis=0
+#     )
+#     labels = jnp.stack([int(item["label"]) for item in batch], axis=0)
 
-    return {
-        "vae_output": latents,
-        "label": labels,
-    }
+#     return {
+#         "vae_output": latents,
+#         "label": labels,
+#     }
 
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
@@ -290,10 +372,10 @@ def trainer(epochs, model, optimizer, train_loader):
                 }
             )
 
-            if step % 500 == 0:
+            if step % 200 == 0:
                 gridfile = sample_image_batch(step, model, sample_labels)
                 image_log = wandb.Image(gridfile)
-                # wandb.log({"image_sample": image_log})
+                wandb.log({"image_sample": image_log})
 
             jax.clear_caches()
             gc.collect()
