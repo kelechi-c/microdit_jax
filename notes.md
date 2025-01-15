@@ -1,20 +1,18 @@
 ### notes....on my tiny video generation model
-So basically, it took me like _2 weeks_ to port MicroDiT to JAX[w/NNX], at least to a _trainable_ version(tok that time to actually learn **jax/tpu** usage lmao). Thank God for the **TRC grant**.
+So basically, it took me like _weeks_ to port MicroDiT to JAX[w/NNX], at least to a _trainable_ version(took that time to actually learn **JAX/tpu** usage lmao). 
 
-Anyways, my goals are: 
+Thank God for the **TRC grant**.
+
+(Update: I paused in and rewrote a lot of stuff and debugged the model, after the official codebase was released Jan 2025. So it _actually_ took me ~2 weeks for the whole implementation/porting).
+
+Anyways, my goals are:
 - develop/train a tiny image generation model
-- implement a tiny video generation backbone w/**microdit** framework.
-- train it on a simple video-label dataset.
+- implement a tiny video generation backbone with the **microdit** framework.
 - scale to text-video hopefully
 - apply the knowledge gained to audio
 
-The goal isn't to get SOTA results, just good outputs :)
+The goal isn't to get SOTA results, just experiments/good outputs :)
 
-Now I gotta choose what model code/paper to merge..
-
-there's Mochi, Allegro, OpenSora, LTX-Vid...Hmmm
-Well, I went with LTX-Video, from Lightricks.
-(Mochi is bettter, but uses MMDiT, which isn't so compatible with microdit)
 
 #### stuff/snippets I learnt/used on the way
  
@@ -55,9 +53,7 @@ state = nnx.state((model, optimizer))
 state = jax.device_get(state)
 nnx.update((model, optimizer), state)
 ```
-2. Moving arrays to multiprocess devices(like v4-32 pod)
-```python
-#from jax.experimental.pjit import pjit
 
+2. Small models can learn basic structures in the image. So I used them for testing. And smaller models(~80m params) work well on faces...not so well for others.
 
-```
+3. Initialize model properly (xavier for linear layer weights, zero constant for biases) for stable training.
