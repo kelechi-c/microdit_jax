@@ -279,6 +279,30 @@ class FeedForward(nnx.Module):
         x = self.w_3(x)
         return x
 
+class SparseMoEBlock(nnx.Module):
+    def __init__(self, embed_dim, num_experts=4, expert_cap=2.0, mlp_ratio=4):
+        super().__init__()
+        self.expert_cap = expert_cap
+        self.num_experts = num_experts
+        hidden = int(mlp_ratio * embed_dim)
+
+        self.w_1 = nnx.Param(jnp.ones((num_experts, embed_dim, hidden)))
+        self.w_2 = nnx.Param(jnp.ones((num_experts, hidden, embed_dim)))
+        
+        self.gate = nnx.Linear(
+            embed_dim, num_experts, rngs=rngs,
+            kernel_init=trunc_init, use_bias=False
+        )
+
+    def __call__(self, x: Array) -> Array:
+        n, t, d = x.shape
+        tokens_per_expert = int(self.expert_cap * t / self.num_experts)
+        scores = self.gate(x)
+        probs = nnx.softmax(scores, axis=-1)
+        g, m = jax.lax.top_k(probs.transpose(0, 2, 1), tokens_per_expert)
+        p = nnx.one_hot(m, t).astype(jnp.bfloat16)
+        
+        return x
 
 ###############
 # DiT blocks_ #
