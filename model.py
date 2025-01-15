@@ -328,6 +328,28 @@ class MLP(nnx.Module):
 
         return x
 
+class FeedForward(nnx.Module):
+    def __init__(self, embed_dim, mlp_ratio=4):
+        super().__init__()
+        hidden = int(mlp_ratio * embed_dim)
+
+        self.w_1 = nnx.Linear(
+            embed_dim, hidden, rngs=rngs,
+            kernel_init=xavier_init, bias_init=zero_init
+        )
+        self.w_2 = nnx.Linear(
+            embed_dim, hidden, rngs=rngs, 
+            kernel_init=xavier_init, bias_init=zero_init
+        )
+        self.w_3 = nnx.Linear(
+            hidden, embed_dim, rngs=rngs, 
+            kernel_init=xavier_init, bias_init=zero_init
+        )
+
+    def __call__(self, x: Array) -> Array:
+        x = self.w_2(x) * nnx.silu(self.w_1(x))
+        x = self.w_3(x)
+        return x
 
 class CaptionEmbedder(nnx.Module):
     def __init__(self, embed_dim, cap_dim, mlp_ratio=4):
@@ -418,7 +440,7 @@ class DiTBlock(nnx.Module):
         self.adaln = nnx.Linear(
             dim, 6 * dim, kernel_init=zero_init, bias_init=zero_init, rngs=rngs
         )
-        self.mlp_block = MLP(dim)
+        self.mlp_block = FeedForward(dim)
 
     def __call__(self, x: Array, y: Array, cond: Array):
         cond = self.adaln(nnx.silu(cond))
@@ -484,43 +506,40 @@ class TransformerBackbone(nnx.Module):
     ):
         super().__init__()
 
-        # # # Define scaling ranges for m_f and m_a
-        # mf_min, mf_max = 0.5, 4.0
-        # ma_min, ma_max = 0.5, 1.0
+        # # Define scaling ranges for m_f and m_a
+        mf_min, mf_max = 0.5, 4.0
+        ma_min, ma_max = 0.5, 1.0
 
-        self.layers = [
-            DiTBlock(embed_dim, num_heads, drop=0.0) for _ in range(num_layers)
-        ]
+        # self.layers = [
+        #     DiTBlock(embed_dim, num_heads, drop=0.0) for _ in range(num_layers)
+        # ]
+        
+        self.layers = []
 
-        # for v in tqdm(range(num_layers)):
-        #     # # Calculate scaling factors for the v-th layer using linear interpolation
-        #     mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
-        #     ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
+        for v in tqdm(range(num_layers)):
+            # # Calculate scaling factors for the v-th layer using linear interpolation
+            mf = mf_min + (mf_max - mf_min) * v / (num_layers - 1)
+            ma = ma_min + (ma_max - ma_min) * v / (num_layers - 1)
 
-        #     # # Scale the dimensions according to the scaling factors
-        #     scaled_mlp_dim = int(mlp_dim * mf)
-        #     scaled_num_heads = max(1, int(num_heads * ma))
-        #     scaled_num_heads = self._nearest_divisor(scaled_num_heads, embed_dim)
-        #     mlp_ratio = scaled_mlp_dim / embed_dim
+            # # Scale the dimensions according to the scaling factors
+            scaled_mlp_dim = int(embed_dim * mf)
+            scaled_num_heads = max(1, int(num_heads * ma))
+            scaled_num_heads = self._nearest_divisor(scaled_num_heads, embed_dim)
+            mlp_ratio = scaled_mlp_dim / embed_dim
+            
+            self.layers.append(DiTBlock(embed_dim, scaled_num_heads, mlp_ratio))
 
-        #     self.layers.append(DiTBlock(embed_dim, scaled_num_heads, mlp_ratio))
+    def _nearest_divisor(self, scaled_num_heads, embed_dim):
+        # Find all divisors of embed_dim
+        divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
+        # Find the nearest divisor
+        nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
 
-    # def _nearest_divisor(self, scaled_num_heads, embed_dim):
-    #     # Find all divisors of embed_dim
-    #     divisors = [i for i in range(1, embed_dim + 1) if embed_dim % i == 0]
-    #     # Find the nearest divisor
-    #     nearest = min(divisors, key=lambda x: abs(x - scaled_num_heads))
-
-    #     return nearest
+        return nearest
 
     def __call__(self, x, c_emb, cond):
-        # x = self.input_embedding(x)
-        # class_emb = self.class_embedding(c_emb)
-
         for layer in self.layers:
             x = layer(x, c_emb, cond)
-
-        # x = self.output_layer(x)
 
         return x
 
@@ -529,13 +548,17 @@ class TransformerBackbone(nnx.Module):
 class PatchMixer(nnx.Module):
     def __init__(self, patch_mix_dim, embed_dim, attn_heads, n_layers=2):
         super().__init__()
-        self.input_map = nnx.Linear(
-            embed_dim,
-            patch_mix_dim,
-            rngs=rngs,
-            bias_init=zero_init,
-            kernel_init=xavier_init,
+        self.input_map = nnx.Sequential(
+            nnx.LayerNorm(embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init),
+            nnx.Linear(
+                embed_dim,
+                patch_mix_dim,
+                rngs=rngs,
+                bias_init=zero_init,
+                kernel_init=xavier_init,
+            )
         )
+
         self.cond_map = nnx.Linear(
             embed_dim,
             patch_mix_dim,
@@ -765,34 +788,21 @@ class MicroDiT(nnx.Module):
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask_ratio=0.0, train=False):
         bsize, height, width, channels = x.shape
-        num_patches_side = height // self.patch_size[0]
-
-        mask = None
-        x = self.patch_embedder(x)
-        B, N, D = x.shape
-
-        # self.log_activation_stats("patch_embedder", x)
-        # print(f"x patched = {x.shape}")
 
         pos_embed = get_2d_sincos_pos_embed(
             embed_dim=self.embed_dim,
             h=height // self.patch_size[0],
             w=width // self.patch_size[1],
         )
-        # print(f'posembed 1 = {pos_embed.shape} / x {x.shape}')
         pos_embed = jnp.expand_dims(pos_embed, axis=0)
-        # pos_embed = jnp.broadcast_to(
-        #     pos_embed, (bsize, pos_embed.shape[1], pos_embed.shape[2])
-        # )
+        
+        mask = None
+        x = self.patch_embedder(x) + pos_embed.astype(x.dtype)
 
         # conditioning layers
-        x = x + pos_embed.astype(x.dtype)
-
         y = self.cap_embedder(y_cap)  # (b, embdim)
-        # y = self.label_embedder(y_cap, train=train)
         y = self.y_process(y[:, None, :])
-        # print(f'{y.shape = }')
-        # y = jnp.broadcast_to(y, shape=(x.shape))
+
 
         t = self.time_embedder(t)[:, None, :]
 
@@ -847,41 +857,17 @@ class MicroDiT(nnx.Module):
             std_val=std_val,
         )
 
-    def sample(self, z_latent: Array, cond, sample_steps=50, cfg=2.0):
-        b_size = z_latent.shape[0]
-        dt = 1.0 / sample_steps
 
-        dt = jnp.array([dt] * b_size)
-        dt = jnp.reshape(dt, shape=(b_size, *([1] * len(z_latent.shape[1:]))))
-
-        images = [z_latent]
-
-        for step in tqdm(range(sample_steps, 0, -1)):
-            t = step / sample_steps
-            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
-
-            vcond, _ = self(z_latent, t, cond, mask=None, train=False)
-            null_cond = jnp.zeros_like(cond)
-            v_uncond = self(z_latent, t, null_cond)
-            vcond = v_uncond + cfg * (vcond - v_uncond)
-
-            z_latent = z_latent - dt * vcond
-            images.append(z_latent)
-
-        return images[-1] / config.vaescale_factor
-
+# rectifed flow forward pass, loss, and smapling
 
 # rectifed flow forward pass, loss, and smapling
 class RectFlowWrapper(nnx.Module):
-    def __init__(self, model: nnx.Module, sigln: bool = True):
+    def __init__(self, model: nnx.Module, mask_ratio=config.mask_ratio):
         self.model = model
-        self.sigln = sigln
+        self.mask_ratio = mask_ratio
 
     def __call__(self, x_input: Array, cond: Array, mask_ratio=config.mask_ratio):
         b_size = x_input.shape[0]  # batch_size
-
-        # if mask is not None:
-        #     mask = mask.astype(jnp.bfloat16)
 
         rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
@@ -894,29 +880,21 @@ class RectFlowWrapper(nnx.Module):
         )  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
-        v_thetha, mask = self.model(
-            z_noise_t, rand_t, cond, mask_ratio=mask_ratio, train=True
-        )
+        v_thetha, mask = self.model(z_noise_t, rand_t, cond, mask_ratio=self.mask_ratio, train=True)
         # print(f'{v_thetha.shape = }')
 
         mean_dim = list(
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
 
-        # if mask is not None:
-        #     x_input = apply_mask(x_input, mask, config.patch_size)
-        #     v_thetha = apply_mask(v_thetha, mask, config.patch_size)
-        #     z_noise = apply_mask(z_noise, mask, config.patch_size)
-
         mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
         batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
 
         loss = jnp.mean(batchwise_mse_loss)
-
+        
         if mask_ratio > 0:
             unmask = 1 - mask
-            loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
-        # loss = loss * 1 / (1 - mask_ratio)
+            loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1) 
 
         return loss.mean()
 
@@ -935,9 +913,11 @@ class RectFlowWrapper(nnx.Module):
             t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
 
             vcond, _ = self.model(z_latent, t, cond, mask_ratio=0.0)
-            null_cond = jnp.zeros_like(cond)
-            v_uncond, _ = self.model(z_latent, t, null_cond)  # type: ignore
-            vcond = v_uncond + cfg * (vcond - v_uncond)
+            
+            if cfg > 1.0:
+                null_cond = jnp.zeros_like(cond)
+                v_uncond, _ = self.model(z_latent, t, null_cond)  # type: ignore
+                vcond = v_uncond + cfg * (vcond - v_uncond)
 
             z_latent = z_latent - dt * vcond
             images.append(z_latent)
