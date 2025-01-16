@@ -73,8 +73,9 @@ print(f"found {num_devices} JAX device(s)")
 for device in devices:
     print(f"{device} / ")
 
+
 mesh_devices = mesh_utils.create_device_mesh((num_devices,))
-mesh = Mesh(mesh_devices, axis_names=("data",))
+mesh = Mesh(mesh_devices, axis_names=("data"))
 data_sharding = NS(mesh, PS("data"))
 rep_sharding = NS(mesh, PS())
 
@@ -101,9 +102,11 @@ local_train_dir = "./imagenet"  # just a local mirror path
 
 class ShapeBatchingDataset(IterableDataset):
     def __init__(
-        self, batch_size=9, shuffle=False, seed=config.seed, buffer_multiplier=20
+        self, batch_size=64, split=1_000_000,
+        shuffle=False, seed=config.seed, 
+        buffer_multiplier=20
     ):
-        self.split_size = 1000
+        self.split_size = split
         self.dataset = load_dataset(
             "SwayStar123/preprocessed_commoncatalog-cc-by",
             streaming=True,
@@ -116,10 +119,10 @@ class ShapeBatchingDataset(IterableDataset):
         self.buffer_multiplier = buffer_multiplier
 
     def __iter__(self):
-        # if self.shuffle:
-        #     self.dataset = self.dataset.shuffle(
-        #         seed=self.seed, buffer_size=self.batch_size * self.buffer_multiplier
-        #     )
+        if self.shuffle:
+            self.dataset = self.dataset.shuffle(
+                seed=self.seed, buffer_size=self.batch_size * self.buffer_multiplier
+            )
 
         shape_batches = defaultdict(list)
         for sample in self.dataset:
@@ -151,7 +154,8 @@ class ShapeBatchingDataset(IterableDataset):
                         np.frombuffer(s["vae_latent"], dtype=np.float32).copy()
                         for s in samples
                     ]
-                )
+                ),
+                dtype=jnp.bfloat16,
             ).reshape(-1, *vae_latent_shape),
             "vae_latent_shape": vae_latent_shape,
             "text_embedding": jnp.array(
@@ -160,13 +164,15 @@ class ShapeBatchingDataset(IterableDataset):
                         np.frombuffer(s["text_embedding"], dtype=np.float16).copy()
                         for s in samples
                     ]
-                )
+                ),
+                dtype=jnp.bfloat16
             ),
         }
+        
         return batch
 
     def __len__(self):
-        return len(self.dataset) // self.batch_size
+        return self.split_size #len(self.dataset) // self.batch_size
 
 
 def jax_collate(batch):
@@ -203,7 +209,6 @@ def device_get_model(model):
 
 
 def sample_image_batch(step, model, labels):
-    print(f"sampling from labels {labels}")
     pred_model = device_get_model(model)
     pred_model.eval()
     image_batch = pred_model.sample(labels)
@@ -262,7 +267,7 @@ def inspect_latents(batch):
     print(batch.shape)
     # img_latents = img_latents / config.vaescale_factor
     batch = [process_img(x) for x in batch]
-    file = f"images/preproc_cc-by-8.jpg"
+    file = f"images/preproc_cc-by.jpg"
     gridfile = image_grid(batch, file)
     print(f"sample saved @ {gridfile}")
 
@@ -290,9 +295,8 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
     params = unfreeze(params)
     params = flax.traverse_util.unflatten_dict(params, sep=".")
     params = from_state_dict(model, params)
-
     nnx.update(model, params)
-
+    
     return model, params
 
 
@@ -330,51 +334,60 @@ def trainer(epochs, model, optimizer, train_loader):
     #     key="",
     #     project_name="microdit",
     # )
+
     stime = time.time()
-    sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
+    
+    # sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
+    sample_captions = None
+    sample_textembed = None
 
     for epoch in tqdm(range(epochs), desc="Training..../"):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
-
+            sample_captions = batch['caption']
+            sample_textembed = batch['text_embedding']
+            
             train_loss, grad_norm = train_step(model, optimizer, batch)
             print(
                 f"step {step}/{len(train_loader)}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
             )
 
-            # wandb.log(
-            #     {
-            #         "loss": train_loss.item(),
-            #         "log_loss": math.log10(train_loss.item()),
-            #         "grad_norm": grad_norm,
-            #         "log_grad_norm": math.log10(grad_norm + 1e-8),
-            #     }
-            # )
+            wandb.log(
+                {
+                    "loss": train_loss.item(),
+                    "log_loss": math.log10(train_loss.item()),
+                    "grad_norm": grad_norm,
+                    "log_grad_norm": math.log10(grad_norm + 1e-8),
+                }
+            )
 
-            if step % 500 == 0:
-                gridfile = sample_image_batch(step, model, sample_labels)
+            if step % 200 == 0:
+                print(f"sampling from...{sample_captions}")
+                
+                gridfile = sample_image_batch(step, model, sample_textembed)
                 image_log = wandb.Image(gridfile)
-                # wandb.log({"image_sample": image_log})
+                wandb.log({"image_sample": image_log})
 
             jax.clear_caches()
             gc.collect()
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
-        path = f"{epoch}_microdit_imagenet_{train_loss}.pkl"
+        path = f"{epoch}_microdit_cc_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
 
-        epoch_file = sample_image_batch(step, model, sample_labels)
+        epoch_file = sample_image_batch(step, model, sample_textembed)
         epoch_image_log = wandb.Image(epoch_file)
         wandb.log({"epoch_sample": epoch_image_log})
 
     etime = time.time() - stime
-    print(f"training time for {epochs} epochs -> {etime:.4f}s / {etime/60:.4f} mins")
-    final_sample = sample_image_batch(step, model, sample_labels)
+    print(f"training time for {epochs} epochs -> {etime/60/60:.4f} hours")
+    
+    final_sample = sample_image_batch(step, model, sample_textembed)
     train_image_log = wandb.Image(final_sample)
-    wandb.log({"epoch_sample": train_image_log})
+    wandb.log({"final_sample": train_image_log})
 
     save_paramdict_pickle(
         model,
-        f"checks/microdit_in1k_step-{len(train_loader)*epochs}_floss-{train_loss}.pkl",
+        f"checks/microdit_cc_step-{len(train_loader)*epochs}_floss-{train_loss:.5f}.pkl",
     )
 
     return model
