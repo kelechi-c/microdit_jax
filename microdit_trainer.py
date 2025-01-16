@@ -41,10 +41,10 @@ class config:
     img_size = 32
     seed = 33
     patch_size = (2, 2)
-    lr = 1e-4
-    mask_ratio = 0.0
+    lr = 3e-4
+    mask_ratio = 0.50
     epochs = 30
-    data_split = 10_000  # imagenet split to train on
+    data_split = 10_000  # data split to train on
     cfg_scale = 2.0
     vaescale_factor = 0.13025
 
@@ -481,15 +481,26 @@ def main(run, epochs, batch_size):
 
     inspect_latents(sp["vae_output"][0].astype(jnp.float32))
 
+    # microdit = MicroDiT(
+    #     in_channels=4,
+    #     patch_size=(2, 2),
+    #     embed_dim=768,
+    #     num_layers=6,
+    #     attn_heads=12,
+    #     patchmix_layers=2,
+    #     patchmix_dim=768,
+    # )
+    
     microdit = MicroDiT(
         in_channels=4,
         patch_size=(2, 2),
-        embed_dim=768,
-        num_layers=6,
-        attn_heads=12,
-        patchmix_layers=2,
-        patchmix_dim=768,
+        embed_dim=1024,
+        num_layers=12,
+        attn_heads=16,
+        patchmix_layers=4,
+        patchmix_dim=768
     )
+
 
     rf_engine = RectFlowWrapper(microdit, mask_ratio=config.mask_ratio)
     graph, state = nnx.split(rf_engine)
@@ -499,7 +510,7 @@ def main(run, epochs, batch_size):
 
     optimizer = nnx.Optimizer(
         rf_engine,
-        optax.adamw(learning_rate=3e-4),
+        optax.adamw(learning_rate=config.lr),
     )
 
     # replicate model across devices
