@@ -169,3 +169,33 @@ def unmask_tokens(x: jnp.ndarray, ids_restore: jnp.ndarray, mask_token) -> jnp.n
     # print(f'{x_unmasked.shape = }')
 
     return x_unmasked
+
+
+def ntopk(
+    x: jax.Array, k: int, axis: int = -1, largest: bool = True, sorted: bool = True
+):
+    sorted_indices = jnp.argsort(-x, axis=-1)
+    # Only keep top k indices
+    indices = sorted_indices[..., :k]
+
+    # Create gather dimensions
+    batch_size, num_experts, _ = x.shape
+    batch_indices = jnp.arange(batch_size)[:, None, None]
+    batch_indices = jnp.broadcast_to(batch_indices, (batch_size, num_experts, k))
+    expert_indices = jnp.arange(num_experts)[None, :, None]
+    expert_indices = jnp.broadcast_to(expert_indices, (batch_size, num_experts, k))
+
+    # Stack indices for gather
+    gather_indices = jnp.stack([batch_indices, expert_indices, indices], axis=-1)
+
+    # Gather values using lax.gather
+    dnums = jax.lax.GatherDimensionNumbers(
+        offset_dims=(), collapsed_slice_dims=(0, 1, 2), start_index_map=(0, 1, 2)
+    )
+    slice_sizes = (1, 1, 1)
+    values = jax.lax.gather(
+        x, gather_indices, dimension_numbers=dnums, slice_sizes=slice_sizes
+    )
+    values = values.reshape(batch_size, num_experts, k)
+
+    return values, indices
