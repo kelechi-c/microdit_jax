@@ -2,6 +2,7 @@
 Training a MicroDIT model, ~300M params, 24-depth, 12 heads config for on Imagenet
 """
 
+from functools import partial
 import jax, optax
 from jax import Array, numpy as jnp, random as jrand
 from jax.sharding import NamedSharding as NS, Mesh, PartitionSpec as PS
@@ -154,26 +155,25 @@ class ShapeBatchingDataset(IterableDataset):
                 dtype=jnp.bfloat16
             ),
         }
-        
+
         return batch
 
     def __len__(self):
         return self.split_size #len(self.dataset) // self.batch_size
 
 
-def jax_collate(batch):
-    latents = jnp.stack(
-        [jnp.array(item["vae_latent"], dtype=jnp.bfloat16) for item in batch], axis=0
-    )
-    labels = jnp.stack(
-        [jnp.array(item["text_embedding"], dtype=jnp.bfloat16) for item in batch],
-        axis=0,
-    )
+# def jax_collate(batch):
+#     latents = jnp.stack(
+#         [jnp.array(item["vae_latent"], dtype=jnp.bfloat16) for item in batch], axis=0
+#     )
+#     labels = jnp.stack(
+#         [jnp.array(item["text_embedding"], dtype=jnp.bfloat16) for item in batch],
+#         axis=0,
+#     )
+#     shape = [item["vae_latent_shape"] for item in batch]
+#     shape = [item["vae_latent_shape"] for item in batch]
 
-    return {
-        "vae_output": latents,
-        "label": labels,
-    }
+#     return {"vae_output": latents, "label": labels, "vae_latent_shape": shape}
 
 
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
@@ -195,14 +195,15 @@ def device_get_model(model):
 
 
 def sample_image_batch(step, model, batch):
-    labels, shape, ground_latents = (
-        batch["label"][0],
-        batch["vae_latent_shape"][0],
-        batch["vae_output"][0],
+    labels, shape, ground_latents, captions = (
+        batch["text_embedding"],
+        batch["vae_latent_shape"],
+        batch["vae_latent"],
+        batch['captions']
     )
     # print(shape)
     start_noise = jrand.normal(randkey, (len(labels), shape[1], shape[2], shape[0]))
-    print(f"sampling from noise of shape {start_noise.shape} / labels {labels}")
+    print(f"sampling from noise of shape {start_noise.shape} / captions {captions}")
 
     pred_model = device_get_model(model)
     pred_model.eval()
@@ -218,7 +219,9 @@ def sample_image_batch(step, model, batch):
     gridfile = image_grid(batch, file)
     print(f"sample saved @ {gridfile}")
     del pred_model
-
+    jax.clear_caches()
+    gc.collect()
+    
     v_sample_error = v_sample_error.mean()
 
     print(f"sample_error {v_sample_error}")
@@ -268,7 +271,7 @@ def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 2)):
 
 def inspect_latents(batch):
     batch = rearrange(batch, "b c h w -> b h w c")
-    print(batch.shape)
+    # print(batch.shape)
     # img_latents = img_latents / config.vaescale_factor
     batch = [process_img(x) for x in batch]
     file = f"images/preproc_cc-by.jpg"
@@ -303,22 +306,20 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
     
     return model, params
 
-
-@nnx.jit
-def train_step(model, optimizer, batch):
-    def loss_func(model, batch):
-        img_latents, label = batch["vae_output"][0], batch["label"][0]
-
+@partial(nnx.jit, in_shardings=(rep_sharding, rep_sharding, data_sharding, data_sharding), out_shardings=(None, None))
+def train_step(model, optimizer, image, text):
+    
+    def loss_func(model, img_latents, label):
         img_latents = (
             rearrange(img_latents, "b c h w -> b h w c") * config.vaescale_factor
         )
-        img_latents, label = jax.device_put((img_latents, label), data_sharding)
+        # img_latents, label = jax.device_put((img_latents, label), data_sharding)
         loss = model(img_latents, label)
 
         return loss
 
     gradfn = nnx.value_and_grad(loss_func)
-    loss, grads = gradfn(model, batch)
+    loss, grads = gradfn(model, image, text)
 
     grad_norm = optax.global_norm(grads)
 
@@ -376,6 +377,7 @@ def trainer(epochs, model, optimizer, train_loader):
         path = f"{epoch}_microdit_cc_{train_loss}.pkl"
         save_paramdict_pickle(model, path)
 
+        print(f"sampling from...{sample_captions}")
         epoch_file = sample_image_batch(step, model, sample_textembed)
         epoch_image_log = wandb.Image(epoch_file)
         wandb.log({"epoch_sample": epoch_image_log})
@@ -399,21 +401,21 @@ def overfit(epochs, model, optimizer, train_loader):
     train_loss = 0.0
     model.train()
 
+    batch = next(iter(train_loader))
+    # print("initial sample..")
+    # gridfile, sample_error = sample_image_batch("initial", model, batch)
+    # print(f'initial sample error: {sample_error.mean()}')
+
     wandb_logger(
-        key="", project_name="microdit_overfit"
+        key="yourkey", project_name="microdit_overfit"
     )
 
     stime = time.time()
 
-    batch = next(iter(train_loader))
-
-    print("initial sample..")
-    # gridfile, sample_error = sample_image_batch("initial", model, batch)
-    # print(f'initial sample error: {sample_error.mean()}')
-
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
-        train_loss, grad_norm = train_step(model, optimizer, batch)
+        latent, text_embed = batch["vae_latent"], batch["text_embedding"]
+        train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
         print(
             f"step {epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm.item()}"
         )
@@ -427,7 +429,7 @@ def overfit(epochs, model, optimizer, train_loader):
             }
         )
 
-        if epoch % 25 == 0:
+        if epoch % 25 == 0 and epoch != 0:
             gridfile, sample_error = sample_image_batch(epoch, model, batch)
             image_log = wandb.Image(gridfile)
             wandb.log({"image_sample": image_log, "sample_error": sample_error})
@@ -451,13 +453,9 @@ def overfit(epochs, model, optimizer, train_loader):
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
 
-    epoch_file, sample_error = sample_image_batch(
-        "overfit", model, batch
-    )
+    epoch_file, sample_error = sample_image_batch("overfit", model, batch)
     epoch_image_log = wandb.Image(epoch_file)
-    wandb.log(
-        {"epoch_sample": epoch_image_log, "overfit_sample_error": sample_error.mean()}
-    )
+    wandb.log({"epoch_sample": epoch_image_log, "overfit_sample_error": sample_error})
 
     return model, train_loss
 
@@ -481,13 +479,14 @@ def main(run, epochs, batch_size, mask_ratio):
 
     dataset = ShapeBatchingDataset(batch_size=batch_size)
 
-    train_loader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        num_workers=0,
-        drop_last=True,
-        collate_fn=jax_collate,
-    )
+    train_loader = dataset
+    # train_loader = DataLoader(
+    #     dataset,
+    #     batch_size=batch_size,
+    #     num_workers=0,
+    #     drop_last=True,
+    #     collate_fn=jax_collate,
+    # )
 
     sp = next(iter(train_loader))
     print(
@@ -498,11 +497,11 @@ def main(run, epochs, batch_size, mask_ratio):
 
     microdit = MicroDiT(
         in_channels=4,
-        patch_size=(1, 1),
+        patch_size=(2, 2),
         embed_dim=768,
         num_layers=16,
         attn_heads=12,
-        patchmix_layers=2,
+        patchmix_layers=4,
         patchmix_dim=768,
         num_experts=4,
     )
