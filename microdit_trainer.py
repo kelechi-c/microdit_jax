@@ -454,16 +454,10 @@ def log_state_values(state_layer):
 @click.command()
 @click.option("-r", "--run", default="overfit")
 @click.option("-e", "--epochs", default=30)
+@click.option("-mr", "--mask_ratio", default=config.mask_ratio)
 @click.option("-bs", "--batch_size", default=config.batch_size)
-def main(run, epochs, batch_size):
+def main(run, epochs, batch_size, mask_ratio):
 
-    # streaming.base.util.clean_stale_shared_memory()
-    # dataset = StreamingDataset(
-    #     local=local_train_dir,
-    #     remote=remote_train_dir,
-    #     split=None,
-    #     batch_size=batch_size,
-    # )
     dataset = ShapeBatchingDataset(batch_size=batch_size)
 
     train_loader = DataLoader(
@@ -481,28 +475,18 @@ def main(run, epochs, batch_size):
 
     inspect_latents(sp["vae_output"][0].astype(jnp.float32))
 
-    # microdit = MicroDiT(
-    #     in_channels=4,
-    #     patch_size=(2, 2),
-    #     embed_dim=768,
-    #     num_layers=6,
-    #     attn_heads=12,
-    #     patchmix_layers=2,
-    #     patchmix_dim=768,
-    # )
-    
     microdit = MicroDiT(
         in_channels=4,
-        patch_size=(2, 2),
-        embed_dim=1024,
-        num_layers=12,
-        attn_heads=16,
-        patchmix_layers=4,
-        patchmix_dim=768
+        patch_size=(1, 1),
+        embed_dim=768,
+        num_layers=16,
+        attn_heads=12,
+        patchmix_layers=2,
+        patchmix_dim=768,
+        num_experts=4,
     )
 
-
-    rf_engine = RectFlowWrapper(microdit, mask_ratio=config.mask_ratio)
+    rf_engine = RectFlowWrapper(microdit, mask_ratio=mask_ratio)
     graph, state = nnx.split(rf_engine)
 
     n_params = sum([p.size for p in jax.tree.leaves(state)])
@@ -510,7 +494,7 @@ def main(run, epochs, batch_size):
 
     optimizer = nnx.Optimizer(
         rf_engine,
-        optax.adamw(learning_rate=config.lr),
+        optax.adamw(learning_rate=3e-4, weight_decay=0.01),
     )
 
     # replicate model across devices
