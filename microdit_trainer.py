@@ -86,20 +86,6 @@ vae = AutoencoderKL.from_pretrained(
 print("loaded vae")
 
 
-class uint8(Encoding):
-    def encode(self, obj: Any) -> bytes:
-        return obj.tobytes()
-
-    def decode(self, data: bytes) -> Any:
-        x = np.frombuffer(data, np.uint8).astype(np.float32)
-        return (x / 255.0 - 0.5) * 24.0
-
-
-_encodings["uint8"] = uint8
-remote_train_dir = "./vae_mds"  # this is the path you installed this dataset.
-local_train_dir = "./imagenet"  # just a local mirror path
-
-
 class ShapeBatchingDataset(IterableDataset):
     def __init__(
         self, batch_size=64, split=1_000_000,
@@ -208,10 +194,24 @@ def device_get_model(model):
     return model
 
 
-def sample_image_batch(step, model, labels):
+def sample_image_batch(step, model, batch):
+    labels, shape, ground_latents = (
+        batch["label"][0],
+        batch["vae_latent_shape"][0],
+        batch["vae_output"][0],
+    )
+    # print(shape)
+    start_noise = jrand.normal(randkey, (len(labels), shape[1], shape[2], shape[0]))
+    print(f"sampling from noise of shape {start_noise.shape} / labels {labels}")
+
     pred_model = device_get_model(model)
     pred_model.eval()
-    image_batch = pred_model.sample(labels)
+
+    image_batch = pred_model.sample(start_noise, labels)
+
+    batch_latents = rearrange(ground_latents, "b c h w -> b h w c")
+    v_sample_error = (batch_latents - image_batch) ** 2
+
     file = f"mdsamples/{step}_microdit.png"
     batch = [process_img(x) for x in image_batch]
 
@@ -219,12 +219,16 @@ def sample_image_batch(step, model, labels):
     print(f"sample saved @ {gridfile}")
     del pred_model
 
-    return gridfile
+    v_sample_error = v_sample_error.mean()
+
+    print(f"sample_error {v_sample_error}")
+
+    return gridfile, v_sample_error
 
 
 def vae_decode(latent, vae=vae):
     tensor_img = rearrange(latent, "b h w c -> b c h w")
-    tensor_img = torch.from_numpy(np.array(tensor_img))
+    tensor_img = torch.from_numpy(np.array(tensor_img)).to(torch.float32)
     x = vae.decode(tensor_img).sample
 
     img = VaeImageProcessor().postprocess(
@@ -239,7 +243,7 @@ def process_img(img):
     return img
 
 
-def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 4)):
+def image_grid(pil_images, file, grid_size=(3, 3), figsize=(4, 2)):
     rows, cols = grid_size
     assert len(pil_images) <= rows * cols, "Grid size must accommodate all images."
 
@@ -304,20 +308,18 @@ def load_paramdict_pickle(model, filename="dit_model.ckpt"):
 def train_step(model, optimizer, batch):
     def loss_func(model, batch):
         img_latents, label = batch["vae_output"][0], batch["label"][0]
-        
+
         img_latents = (
             rearrange(img_latents, "b c h w -> b h w c") * config.vaescale_factor
         )
         img_latents, label = jax.device_put((img_latents, label), data_sharding)
-
-        loss = model(img_latents, label, mask_ratio=config.mask_ratio)
+        loss = model(img_latents, label)
 
         return loss
 
     gradfn = nnx.value_and_grad(loss_func)
     loss, grads = gradfn(model, batch)
-    # print(f'{grads.shape = }')
-    # grads = optax.per_example_global_norm_clip(grads, 1.0)
+
     grad_norm = optax.global_norm(grads)
 
     optimizer.update(grads)
@@ -336,7 +338,7 @@ def trainer(epochs, model, optimizer, train_loader):
     # )
 
     stime = time.time()
-    
+
     # sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
     sample_captions = None
     sample_textembed = None
@@ -345,7 +347,7 @@ def trainer(epochs, model, optimizer, train_loader):
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
             sample_captions = batch['caption']
             sample_textembed = batch['text_embedding']
-            
+
             train_loss, grad_norm = train_step(model, optimizer, batch)
             print(
                 f"step {step}/{len(train_loader)}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
@@ -362,7 +364,7 @@ def trainer(epochs, model, optimizer, train_loader):
 
             if step % 200 == 0:
                 print(f"sampling from...{sample_captions}")
-                
+
                 gridfile = sample_image_batch(step, model, sample_textembed)
                 image_log = wandb.Image(gridfile)
                 wandb.log({"image_sample": image_log})
@@ -380,7 +382,7 @@ def trainer(epochs, model, optimizer, train_loader):
 
     etime = time.time() - stime
     print(f"training time for {epochs} epochs -> {etime/60/60:.4f} hours")
-    
+
     final_sample = sample_image_batch(step, model, sample_textembed)
     train_image_log = wandb.Image(final_sample)
     wandb.log({"final_sample": train_image_log})
@@ -404,7 +406,11 @@ def overfit(epochs, model, optimizer, train_loader):
     stime = time.time()
 
     batch = next(iter(train_loader))
-    
+
+    print("initial sample..")
+    # gridfile, sample_error = sample_image_batch("initial", model, batch)
+    # print(f'initial sample error: {sample_error.mean()}')
+
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
         train_loss, grad_norm = train_step(model, optimizer, batch)
@@ -422,21 +428,36 @@ def overfit(epochs, model, optimizer, train_loader):
         )
 
         if epoch % 25 == 0:
-            gridfile = sample_image_batch(epoch, model, batch["label"][0])
+            gridfile, sample_error = sample_image_batch(epoch, model, batch)
             image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
+            wandb.log({"image_sample": image_log, "sample_error": sample_error})
+
+        if epoch % 400 == 0 and epoch != 0:
+            save_paramdict_pickle(
+                model,
+                f"checks/microdit-moe_overfitting_step-{epoch}.pkl",
+            )
+            print(f"checkpoint @ {epoch}")
 
         jax.clear_caches()
         gc.collect()
 
     etime = time.time() - stime
+    save_paramdict_pickle(
+        model,
+        f"checks/microdit_overfitting_all{epochs}.pkl",
+    )
     print(
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
 
-    epoch_file = sample_image_batch("overfit", model, batch["label"])
+    epoch_file, sample_error = sample_image_batch(
+        "overfit", model, batch
+    )
     epoch_image_log = wandb.Image(epoch_file)
-    wandb.log({"epoch_sample": epoch_image_log})
+    wandb.log(
+        {"epoch_sample": epoch_image_log, "overfit_sample_error": sample_error.mean()}
+    )
 
     return model, train_loss
 
