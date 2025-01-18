@@ -156,7 +156,6 @@ class TimestepEmbedder(nnx.Module):
     def __call__(self, x: Array) -> Array:
         t_freq = self.timestep_embedding(x, self.freq_embed_size)
         t_embed = nnx.silu(self.lin_1(t_freq))
-
         return self.lin_2(t_embed)
 
 
@@ -206,7 +205,6 @@ class MLP(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         x = nnx.gelu(self.linear_1(x))
-        # x = self.norm_1(x)
         x = self.linear_2(x)
 
         return x
@@ -302,14 +300,27 @@ class SparseMoEBlock(nnx.Module):
         g, m = jax.lax.top_k(probs.transpose(0, 2, 1), tokens_per_expert)
         p = nnx.one_hot(m, t).astype(jnp.bfloat16)
         
-        return x
+        xin = jnp.einsum('nekt, ntd -> nekd', p, x)
+        h = jnp.einsum('nekd, edf -> nekf', xin, self.w_1)
+        h = nnx.gelu(h)
+        h = jnp.einsum('nekf, efd -> nekd', h, self.w_2)
+        
+        out = jnp.expand_dims(g, axis=-1) * h
+        out = jnp.einsum('nekt, nekd -> ntd', p, out)
+        return out
 
 ###############
 # DiT blocks_ #
 ###############
 class DiTBlock(nnx.Module):
     def __init__(
-        self, dim: int, attn_heads: int, drop: float = 0.0, rngs=nnx.Rngs(config.seed)
+        self,
+        dim: int, attn_heads: int,
+        moe_block: bool,
+        num_experts, expert_cap,
+        drop: float = 0.0,
+        mlp_ratio = 4,
+        rngs=nnx.Rngs(config.seed)
     ):
         super().__init__()
         self.dim = dim
@@ -344,8 +355,11 @@ class DiTBlock(nnx.Module):
         self.adaln = nnx.Linear(
             dim, 6 * dim, kernel_init=zero_init, bias_init=zero_init, rngs=rngs
         )
-        self.mlp_block = FeedForward(dim)
-
+        self.mlp_block = (
+            FeedForward(dim) if not moe_block else
+            SparseMoEBlock(dim, num_experts, expert_cap, mlp_ratio)
+        )
+        
     def __call__(self, x: Array, y: Array, cond: Array):
         cond = self.adaln(nnx.silu(cond))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -405,6 +419,9 @@ class TransformerBackbone(nnx.Module):
         embed_dim: int,
         num_layers: int,
         num_heads: int,
+        experts_every_n=2,
+        num_experts=8,
+        expert_cap=2
     ):
         super().__init__()
 
@@ -415,6 +432,14 @@ class TransformerBackbone(nnx.Module):
         # self.layers = [
         #     DiTBlock(embed_dim, num_heads, drop=0.0) for _ in range(num_layers)
         # ]
+        expert_blocks_idx = [
+            i for i in range(0, num_layers - 1) 
+            if (i+1) % experts_every_n == 0
+        ]
+        is_moe_block = [
+            True if i in expert_blocks_idx else False 
+            for i in range(num_layers)
+        ]
 
         self.layers = []
 
@@ -427,9 +452,18 @@ class TransformerBackbone(nnx.Module):
             scaled_mlp_dim = int(embed_dim * mf)
             scaled_num_heads = max(1, int(num_heads * ma))
             scaled_num_heads = self._nearest_divisor(scaled_num_heads, embed_dim)
-            mlp_ratio = scaled_mlp_dim / embed_dim
+            mlp_ratio = int(scaled_mlp_dim / embed_dim)
 
-            self.layers.append(DiTBlock(embed_dim, scaled_num_heads, mlp_ratio))
+            self.layers.append(
+                DiTBlock(
+                    dim=embed_dim, 
+                    attn_heads=scaled_num_heads,
+                    mlp_ratio=mlp_ratio,
+                    num_experts=num_experts,
+                    expert_cap=expert_cap,
+                    moe_block=is_moe_block[v]
+                )
+            )
 
     def _nearest_divisor(self, scaled_num_heads, embed_dim):
         # Find all divisors of embed_dim
@@ -448,8 +482,22 @@ class TransformerBackbone(nnx.Module):
 
 # patch mixer module
 class PatchMixer(nnx.Module):
-    def __init__(self, patch_mix_dim, embed_dim, attn_heads, n_layers=2):
+    def __init__(
+        self, patch_mix_dim, embed_dim, attn_heads,
+        patchmix_layers=2, experts_every_n=2, 
+        num_experts=8, expert_cap=2
+    ):
         super().__init__()
+        
+        patchmix_expert_blocks_idx = [
+            i for i in range(1, patchmix_layers)
+            if (i+1) % experts_every_n == 0
+        ]
+        patchmix_is_moe_block = [
+            True if i in patchmix_expert_blocks_idx else False 
+            for i in range(patchmix_layers)
+        ]
+        
         self.input_map = nnx.Sequential(
             nnx.LayerNorm(embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init),
             nnx.Linear(
@@ -469,9 +517,14 @@ class PatchMixer(nnx.Module):
             kernel_init=xavier_init,
         )
         self.layers = [
-            DiTBlock(patch_mix_dim, attn_heads, drop=0.0) for _ in range(n_layers)
+            DiTBlock(
+                dim=patch_mix_dim, attn_heads=attn_heads,
+                num_experts=num_experts, expert_cap=expert_cap,
+                drop=0.0, moe_block=patchmix_is_moe_block[k]
+            ) for k in range(patchmix_layers)
         ]
-
+        
+        
         self.out_map = nnx.Linear(
             patch_mix_dim,
             embed_dim,
@@ -619,6 +672,8 @@ class MicroDiT(nnx.Module):
         patchmix_layers=4,
         patchmix_dim=512,
         caption_dim=1152,
+        num_experts=4,
+        experts_every_n: int = 2,
         mask_ratio=0.0,
     ):
         super().__init__()
@@ -640,17 +695,20 @@ class MicroDiT(nnx.Module):
         mask_token_value = jnp.zeros(
             (1, 1, patch_size[0] * patch_size[1] * in_channels), dtype=jnp.bfloat16
         )
+        
         self.mask_token = nnx.Param(mask_token_value)
         jax.lax.stop_gradient(self.mask_token.value)
-
+        
         self.patch_mixer = PatchMixer(
-            patchmix_dim, embed_dim, attn_heads, patchmix_layers
+            patchmix_dim, embed_dim,
+            attn_heads, patchmix_layers, num_experts=num_experts
         )
 
         self.backbone = TransformerBackbone(
             embed_dim,
             num_layers=num_layers,
             num_heads=attn_heads,
+            num_experts=num_experts,
         )
 
         self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
@@ -672,6 +730,7 @@ class MicroDiT(nnx.Module):
         reconstructed = x.reshape((bs, height, width, in_channels))
 
         return reconstructed
+    
 
     def __call__(self, x: Array, t: Array, y_cap: Array, mask_ratio=0.0, train=False):
         bsize, height, width, channels = x.shape
@@ -757,16 +816,19 @@ class RectFlowWrapper(nnx.Module):
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
 
-        mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
-        batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        loss = (z_noise - x_input - v_thetha) ** 2  # squared difference
+        # loss = jnp.mean(loss, axis=mean_dim)  # mean loss
 
-        loss = jnp.mean(batchwise_mse_loss)
-
+        # if mask_ratio > 0:
+        #     unmask = 1 - mask
+        #     loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
         if mask_ratio > 0:
-            unmask = 1 - mask
-            loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
+                unmask = 1 - mask
+                loss = (loss * unmask)
 
         return loss.mean()
+        # loss = jnp.mean(loss)
+        # return loss.mean()
 
     def sample(self, cond, sample_steps=50, cfg=2.0):
         z_latent = jrand.normal(randkey, (len(cond), 22, 44, 4))  # noise
