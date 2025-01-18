@@ -1,22 +1,14 @@
 import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from einops import rearrange
-from typing import Dict
-import numpy as np
 from flax import nnx
 from tqdm.auto import tqdm
 
-
 class config:
-    batch_size = 128
-    img_size = 32
     seed = 42
-    patch_size = (2, 2)
+    patch_size = (1, 1)
     lr = 1e-4
     mask_ratio = 0.0
-    epochs = 30
-    data_split = 10_000  # imagenet split to train on
-    cfg_scale = 3.0
     vaescale_factor = 0.13025
 
 
@@ -24,11 +16,11 @@ rkey = jrand.key(config.seed)
 randkey = jrand.key(config.seed)
 rngs = nnx.Rngs(config.seed)
 
+
 # model helper functions
 # modulation with shift and scale
 def modulate(x, shift, scale):
     return x * (1 + scale[:, None]) + shift[:, None]
-
 
 def t2i_modulate(x, shift, scale):
     return x * (1 + scale) + shift
@@ -87,14 +79,14 @@ trunc_init = nnx.initializers.truncated_normal(0.02)
 # input patchify layer, 2D image to patches
 class PatchEmbed(nnx.Module):
     def __init__(
-        self, in_channels=4, img_size: int = (22, 44), dim=768, patch_size: int = 2
+        self, in_channels=4,
+        img_size: int = (22, 44), dim=768, 
+        patch_size: int = 2
     ):
         self.dim = dim
         self.patch_size = patch_size
         patch_tuple = (patch_size, patch_size)
-        self.num_patches = (img_size[0] // self.patch_size) * (
-            img_size[1] // self.patch_size
-        )
+        self.num_patches = (img_size[0] // self.patch_size) * (img_size[1] // self.patch_size)
         self.conv_project = nnx.Conv(
             in_channels,
             dim,
@@ -113,14 +105,11 @@ class PatchEmbed(nnx.Module):
         num_patches_side_w = W // self.patch_size
 
         x = self.conv_project(x)  # (B, P, P, hidden_size)
-        x = rearrange(
-            x, "b h w c -> b (h w) c", h=num_patches_side_h, w=num_patches_side_w
-        )
+        x = rearrange(x, "b h w c -> b (h w) c", h=num_patches_side_h, w=num_patches_side_w)
         return x
 
-
 class TimestepEmbedder(nnx.Module):
-    def __init__(self, hidden_size, freq_embed_size=256):
+    def __init__(self, hidden_size, freq_embed_size=512):
         super().__init__()
         self.lin_1 = nnx.Linear(
             freq_embed_size,
@@ -138,24 +127,28 @@ class TimestepEmbedder(nnx.Module):
         )
         self.freq_embed_size = freq_embed_size
 
-    @staticmethod
-    def timestep_embedding(time_array: Array, dim, max_period=10000):
+    def timestep_embedding(self, t, max_period=10000):
+        """
+        Create sinusoidal timestep embeddings.
+        :param t: a 1-D Tensor of N indices, one per batch element.
+                        These may be fractional.
+        :param dim: the dimension of the output.
+        :param max_period: controls the minimum frequency of the embeddings.
+        :return: an (N, D) Tensor of positional embeddings.
+        """
+        # https://github.com/openai/glide-text2im/blob/main/glide_text2im/nn.py
+        t = jax.lax.convert_element_type(t, jnp.float32)
+        dim = self.freq_embed_size
         half = dim // 2
-        freqs = jnp.exp(-math.log(max_period) * jnp.arange(0, half) / half)
-
-        args = jnp.float_(time_array[:, None]) * freqs[None]
-
-        embedding = jnp.concat([jnp.cos(args), jnp.sin(args)], axis=-1)
-        if dim % 2:
-            embedding = jnp.concat(
-                [embedding, jnp.zeros_like(embedding[:, :1])], axis=-1
-            )
-
+        freqs = jnp.exp( -math.log(max_period) * jnp.arange(start=0, stop=half, dtype=jnp.float32) / half)
+        args = t[:, None] * freqs[None]
+        embedding = jnp.concatenate([jnp.cos(args), jnp.sin(args)], axis=-1)
         return embedding
 
     def __call__(self, x: Array) -> Array:
         t_freq = self.timestep_embedding(x, self.freq_embed_size)
         t_embed = nnx.silu(self.lin_1(t_freq))
+
         return self.lin_2(t_embed)
 
 
@@ -196,6 +189,12 @@ class MLP(nnx.Module):
     def __init__(self, embed_dim, mlp_ratio=4):
         super().__init__()
         hidden = int(mlp_ratio * embed_dim)
+        # self.norm_1 = nnx.LayerNorm(
+        #     embed_dim, epsilon=1e-6,
+        #     rngs=rngs, bias_init=zero_init,
+        #     scale_init=one_init
+        # )
+
         self.linear_1 = nnx.Linear(
             embed_dim, hidden, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
         )
@@ -205,6 +204,7 @@ class MLP(nnx.Module):
 
     def __call__(self, x: Array) -> Array:
         x = nnx.gelu(self.linear_1(x))
+        # x = self.norm_1(x)
         x = self.linear_2(x)
 
         return x
@@ -238,7 +238,7 @@ class PoolMLP(nnx.Module):
             embed_dim,
             rngs=rngs,
             kernel_init=xavier_init,
-            bias_init=zero_init,
+            bias_init=zero_init
         )
         self.linear_2 = nnx.Linear(
             embed_dim,
@@ -256,6 +256,8 @@ class PoolMLP(nnx.Module):
 
         return x
 
+from einops import einsum
+
 
 class FeedForward(nnx.Module):
     def __init__(self, embed_dim, mlp_ratio=4):
@@ -263,7 +265,8 @@ class FeedForward(nnx.Module):
         hidden = int(mlp_ratio * embed_dim)
 
         self.w_1 = nnx.Linear(
-            embed_dim, hidden, rngs=rngs, kernel_init=trunc_init, bias_init=zero_init
+            embed_dim, hidden, rngs=rngs,
+            kernel_init=trunc_init, bias_init=zero_init
         )
         self.w_2 = nnx.Linear(
             embed_dim, hidden, rngs=rngs, kernel_init=xavier_init, bias_init=zero_init
@@ -277,6 +280,39 @@ class FeedForward(nnx.Module):
         x = self.w_3(x)
         return x
 
+
+def ntopk(
+    x: jax.Array, k: int, axis: int = -1, largest: bool = True, sorted: bool = True
+):
+    sorted_indices = jnp.argsort(-x, axis=-1)
+    # Only keep top k indices
+    indices = sorted_indices[..., :k]
+
+    # Create gather dimensions
+    batch_size, num_experts, _ = x.shape
+    batch_indices = jnp.arange(batch_size)[:, None, None]
+    batch_indices = jnp.broadcast_to(batch_indices, (batch_size, num_experts, k))
+    expert_indices = jnp.arange(num_experts)[None, :, None]
+    expert_indices = jnp.broadcast_to(expert_indices, (batch_size, num_experts, k))
+
+    # Stack indices for gather
+    gather_indices = jnp.stack([batch_indices, expert_indices, indices], axis=-1)
+
+    # Gather values using lax.gather
+    dnums = jax.lax.GatherDimensionNumbers(
+        offset_dims=(),
+        collapsed_slice_dims=(0, 1, 2),
+        start_index_map=(0, 1, 2)
+    )
+    slice_sizes = (1, 1, 1)
+    values = jax.lax.gather(
+        x, gather_indices, dimension_numbers=dnums, slice_sizes=slice_sizes
+    )
+    values = values.reshape(batch_size, num_experts, k)
+
+    return values, indices
+
+
 class SparseMoEBlock(nnx.Module):
     def __init__(self, embed_dim, num_experts=4, expert_cap=2.0, mlp_ratio=4):
         super().__init__()
@@ -286,28 +322,40 @@ class SparseMoEBlock(nnx.Module):
 
         self.w_1 = nnx.Param(jnp.ones((num_experts, embed_dim, hidden)))
         self.w_2 = nnx.Param(jnp.ones((num_experts, hidden, embed_dim)))
-        
+
         self.gate = nnx.Linear(
-            embed_dim, num_experts, rngs=rngs,
-            kernel_init=trunc_init, use_bias=False
+            embed_dim, num_experts, rngs=rngs, kernel_init=trunc_init, use_bias=False
         )
 
     def __call__(self, x: Array) -> Array:
+        x = x.astype(jnp.float32)
         n, t, d = x.shape
         tokens_per_expert = int(self.expert_cap * t / self.num_experts)
+        
         scores = self.gate(x)
-        probs = nnx.softmax(scores, axis=-1)
-        g, m = jax.lax.top_k(probs.transpose(0, 2, 1), tokens_per_expert)
-        p = nnx.one_hot(m, t).astype(jnp.bfloat16)
+        probs = jax.nn.softmax(scores, axis=-1)
+        # print(f"1 {probs.shape = }")
+        probs = jnp.permute_dims(probs, (0, 2, 1))
+        # print(f'2 {probs.shape = }')
+        # g, m = jax.lax.top_k(probs, tokens_per_expert)
+        g, m = ntopk(probs, tokens_per_expert)
+        # print(f'{g.shape = }/{m.shape = }')
         
-        xin = jnp.einsum('nekt, ntd -> nekd', p, x)
-        h = jnp.einsum('nekd, edf -> nekf', xin, self.w_1)
+        p = jax.nn.one_hot(m, num_classes=t, dtype=jnp.float32)  # .astype(jnp.bfloat16)
+        # print(f'{p.shape = }')
+
+        xin = einsum(p, x, "n e k t, n t d -> n e k d")
+        # print(f'{xin.shape = }')
+
+        h = einsum(xin, self.w_1.value, "n e k d, e d f -> n e k f")
         h = nnx.gelu(h)
-        h = jnp.einsum('nekf, efd -> nekd', h, self.w_2)
-        
+        h = einsum(h, self.w_2.value, "n e k f, e f d -> n e k d")
+
         out = jnp.expand_dims(g, axis=-1) * h
-        out = jnp.einsum('nekt, nekd -> ntd', p, out)
-        return out
+        out = einsum(p, out, "n e k t, n e k d -> n t d")
+        # print(f'out {out.shape = } {out}')
+        return out.astype(jnp.bfloat16)
+
 
 ###############
 # DiT blocks_ #
@@ -315,12 +363,14 @@ class SparseMoEBlock(nnx.Module):
 class DiTBlock(nnx.Module):
     def __init__(
         self,
-        dim: int, attn_heads: int,
+        dim: int,
+        attn_heads: int,
         moe_block: bool,
-        num_experts, expert_cap,
+        num_experts,
+        expert_cap,
         drop: float = 0.0,
-        mlp_ratio = 4,
-        rngs=nnx.Rngs(config.seed)
+        mlp_ratio=4,
+        rngs=nnx.Rngs(config.seed),
     ):
         super().__init__()
         self.dim = dim
@@ -356,10 +406,11 @@ class DiTBlock(nnx.Module):
             dim, 6 * dim, kernel_init=zero_init, bias_init=zero_init, rngs=rngs
         )
         self.mlp_block = (
-            FeedForward(dim) if not moe_block else
-            SparseMoEBlock(dim, num_experts, expert_cap, mlp_ratio)
+            FeedForward(dim)
+            if not moe_block
+            else SparseMoEBlock(dim, num_experts, expert_cap, mlp_ratio)
         )
-        
+
     def __call__(self, x: Array, y: Array, cond: Array):
         cond = self.adaln(nnx.silu(cond))
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
@@ -420,8 +471,8 @@ class TransformerBackbone(nnx.Module):
         num_layers: int,
         num_heads: int,
         experts_every_n=2,
-        num_experts=8,
-        expert_cap=2
+        num_experts=4,
+        expert_cap=2,
     ):
         super().__init__()
 
@@ -432,13 +483,12 @@ class TransformerBackbone(nnx.Module):
         # self.layers = [
         #     DiTBlock(embed_dim, num_heads, drop=0.0) for _ in range(num_layers)
         # ]
+
         expert_blocks_idx = [
-            i for i in range(0, num_layers - 1) 
-            if (i+1) % experts_every_n == 0
+            i for i in range(0, num_layers - 1) if (i + 1) % experts_every_n == 0
         ]
         is_moe_block = [
-            True if i in expert_blocks_idx else False 
-            for i in range(num_layers)
+            True if i in expert_blocks_idx else False for i in range(num_layers)
         ]
 
         self.layers = []
@@ -456,14 +506,16 @@ class TransformerBackbone(nnx.Module):
 
             self.layers.append(
                 DiTBlock(
-                    dim=embed_dim, 
+                    dim=embed_dim,
                     attn_heads=scaled_num_heads,
                     mlp_ratio=mlp_ratio,
                     num_experts=num_experts,
                     expert_cap=expert_cap,
-                    moe_block=is_moe_block[v]
+                    moe_block=is_moe_block[v],
                 )
             )
+
+        # self.backbone = nnx.Sequential(*self.layers)
 
     def _nearest_divisor(self, scaled_num_heads, embed_dim):
         # Find all divisors of embed_dim
@@ -476,6 +528,8 @@ class TransformerBackbone(nnx.Module):
     def __call__(self, x, c_emb, cond):
         for layer in self.layers:
             x = layer(x, c_emb, cond)
+        
+        # x = self.backbone(x, c_emb, cond)
 
         return x
 
@@ -483,21 +537,25 @@ class TransformerBackbone(nnx.Module):
 # patch mixer module
 class PatchMixer(nnx.Module):
     def __init__(
-        self, patch_mix_dim, embed_dim, attn_heads,
-        patchmix_layers=2, experts_every_n=2, 
-        num_experts=8, expert_cap=2
+        self,
+        patch_mix_dim,
+        embed_dim,
+        attn_heads,
+        patchmix_layers=2,
+        experts_every_n=2,
+        num_experts=4,
+        expert_cap=2,
     ):
         super().__init__()
-        
+
         patchmix_expert_blocks_idx = [
-            i for i in range(1, patchmix_layers)
-            if (i+1) % experts_every_n == 0
+            i for i in range(1, patchmix_layers) if (i + 1) % experts_every_n == 0
         ]
         patchmix_is_moe_block = [
-            True if i in patchmix_expert_blocks_idx else False 
+            True if i in patchmix_expert_blocks_idx else False
             for i in range(patchmix_layers)
         ]
-        
+
         self.input_map = nnx.Sequential(
             nnx.LayerNorm(embed_dim, epsilon=1e-6, rngs=rngs, bias_init=zero_init),
             nnx.Linear(
@@ -518,13 +576,18 @@ class PatchMixer(nnx.Module):
         )
         self.layers = [
             DiTBlock(
-                dim=patch_mix_dim, attn_heads=attn_heads,
-                num_experts=num_experts, expert_cap=expert_cap,
-                drop=0.0, moe_block=patchmix_is_moe_block[k]
-            ) for k in range(patchmix_layers)
+                dim=patch_mix_dim,
+                attn_heads=attn_heads,
+                num_experts=num_experts,
+                expert_cap=expert_cap,
+                drop=0.0,
+                moe_block=patchmix_is_moe_block[k],
+            )
+            for k in range(patchmix_layers)
         ]
         
-        
+        # self.patchmix = nnx.Sequential(*self.layers)
+
         self.out_map = nnx.Linear(
             patch_mix_dim,
             embed_dim,
@@ -540,6 +603,7 @@ class PatchMixer(nnx.Module):
 
         for layer in self.layers:
             x = layer(x, y, c)
+        # x = self.patchmix(x, y, c)
 
         x = self.out_map(x)
         return x
@@ -582,7 +646,7 @@ def get_mask(
     length: int,
     mask_ratio: float,
     key=randkey,
-) -> Dict[str, jnp.ndarray]:
+):
 
     len_keep = int(length * (1 - mask_ratio))
     key_noise = jax.random.split(key)[0]
@@ -664,7 +728,7 @@ class MicroDiT(nnx.Module):
     def __init__(
         self,
         in_channels=4,
-        patch_size=(2, 2),
+        patch_size=(1, 1),
         embed_dim=1024,
         num_layers=12,
         attn_heads=16,
@@ -695,13 +759,16 @@ class MicroDiT(nnx.Module):
         mask_token_value = jnp.zeros(
             (1, 1, patch_size[0] * patch_size[1] * in_channels), dtype=jnp.bfloat16
         )
-        
+
         self.mask_token = nnx.Param(mask_token_value)
         jax.lax.stop_gradient(self.mask_token.value)
-        
+
         self.patch_mixer = PatchMixer(
-            patchmix_dim, embed_dim,
-            attn_heads, patchmix_layers, num_experts=num_experts
+            patchmix_dim,
+            embed_dim,
+            attn_heads,
+            patchmix_layers,
+            num_experts=num_experts,
         )
 
         self.backbone = TransformerBackbone(
@@ -713,26 +780,19 @@ class MicroDiT(nnx.Module):
 
         self.final_linear = FinalMLP(embed_dim, patch_size=patch_size, out_channels=4)
 
-    def _unpatchify(self, x, patch_size=(2, 2), height=22, width=44):
+    def _unpatchify(self, x, patch_size=(1, 1), height=22, width=44):
         bs, num_patches, patch_dim = x.shape
         H, W = patch_size
         in_channels = patch_dim // (H * W)
-        # Calculate the number of patches along each dimension
         num_patches_h, num_patches_w = height // H, width // W
 
-        # Reshape x to (bs, num_patches_h, num_patches_w, H, W, in_channels)
         x = x.reshape((bs, num_patches_h, num_patches_w, H, W, in_channels))
-
-        # transpose x to (bs, num_patches_h, H, num_patches_w, W, in_channels)
         x = x.transpose(0, 1, 3, 2, 4, 5)
-
-        # Reshape x to (bs, height, width, in_channels)
         reconstructed = x.reshape((bs, height, width, in_channels))
 
         return reconstructed
-    
 
-    def __call__(self, x: Array, t: Array, y_cap: Array, mask_ratio=0.0, train=False):
+    def __call__(self, x: Array, t: Array, y_cap: Array, mask_ratio=0.0):
         bsize, height, width, channels = x.shape
 
         pos_embed = get_2d_sincos_pos_embed(
@@ -753,7 +813,7 @@ class MicroDiT(nnx.Module):
         t = self.time_embedder(t) + y_pooled
         cond_ty = t.astype(x.dtype)[:, None, :]
 
-        x = self.patch_mixer(x, y, cond_ty)
+        x = self.patch_mixer(x=x, y=y, c=cond_ty)
 
         if mask_ratio > 0:
             # mask_dict = mask
@@ -793,8 +853,9 @@ class RectFlowWrapper(nnx.Module):
         self.model = model
         self.mask_ratio = mask_ratio
 
-    def __call__(self, x_input: Array, cond: Array, mask_ratio=config.mask_ratio):
+    def __call__(self, x_input: Array, cond: Array):
         b_size = x_input.shape[0]  # batch_size
+        # mask_ratio = self.mask_ratio
 
         rand = jrand.uniform(randkey, (b_size,)).astype(jnp.bfloat16)
         rand_t = nnx.sigmoid(rand)
@@ -807,31 +868,29 @@ class RectFlowWrapper(nnx.Module):
         )  # input noise with same dim as image
         z_noise_t = (1 - texp) * x_input + texp * z_noise
 
-        v_thetha, mask = self.model(
-            z_noise_t, rand_t, cond, mask_ratio=self.mask_ratio, train=True
-        )
+        v_thetha, mask = self.model(z_noise_t, rand_t, cond, mask_ratio=self.mask_ratio)
         # print(f'{v_thetha.shape = }')
 
         mean_dim = list(
             range(1, len(x_input.shape))
         )  # across all dimensions except the batch dim
 
-        loss = (z_noise - x_input - v_thetha) ** 2  # squared difference
-        # loss = jnp.mean(loss, axis=mean_dim)  # mean loss
+        mean_square = (z_noise - x_input - v_thetha) ** 2  # squared difference
+        loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        # loss_v2 = z_noise - v_thetha
+        # loss = (z_noise - x_input - v_thetha) ** 2  # squared difference
+        loss = jnp.mean(loss)  # mean loss
 
-        # if mask_ratio > 0:
-        #     unmask = 1 - mask
-        #     loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
-        if mask_ratio > 0:
-                unmask = 1 - mask
-                loss = (loss * unmask)
+        if self.mask_ratio > 0:
+            unmask = 1 - mask
+            loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
 
-        return loss.mean()
-        # loss = jnp.mean(loss)
-        # return loss.mean()
+        loss = loss.mean()
 
-    def sample(self, cond, sample_steps=50, cfg=2.0):
-        z_latent = jrand.normal(randkey, (len(cond), 22, 44, 4))  # noise
+        return loss
+
+
+    def sample(self, z_latent, cond, sample_steps=100, cfg=2.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
 
