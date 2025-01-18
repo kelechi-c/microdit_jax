@@ -90,7 +90,7 @@ print("loaded vae")
 class ShapeBatchingDataset(IterableDataset):
     def __init__(
         self, batch_size=64, split=1_000_000,
-        shuffle=False, seed=config.seed, 
+        shuffle=True, seed=config.seed, 
         buffer_multiplier=20
     ):
         self.split_size = split
@@ -330,26 +330,33 @@ def train_step(model, optimizer, image, text):
 
 def trainer(epochs, model, optimizer, train_loader):
     train_loss = 0.0
-
     model.train()
 
+    batch = next(iter(train_loader))
+    print("initial sample..")
+    gridfile, sample_error = sample_image_batch("initial", model, batch)
+    
     # wandb_logger(
     #     key="",
     #     project_name="microdit",
     # )
 
     stime = time.time()
-
-    # sample_labels = jnp.array([76, 292, 293, 979, 968, 967, 33, 88, 404])
     sample_captions = None
     sample_textembed = None
+    main_batch = None
 
     for epoch in tqdm(range(epochs), desc="Training..../"):
+        print(f'training for the {epoch+1}th epoch')
+        
         for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            main_batch = batch
             sample_captions = batch['caption']
             sample_textembed = batch['text_embedding']
 
-            train_loss, grad_norm = train_step(model, optimizer, batch)
+            latent, text_embed = batch["vae_latent"], batch["text_embedding"]
+            
+            train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)            
             print(
                 f"step {step}/{len(train_loader)}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
             )
@@ -363,13 +370,19 @@ def trainer(epochs, model, optimizer, train_loader):
                 }
             )
 
-            if step % 200 == 0:
+            if step % 100 == 0 and step != 0:
                 print(f"sampling from...{sample_captions}")
-
                 gridfile = sample_image_batch(step, model, sample_textembed)
                 image_log = wandb.Image(gridfile)
                 wandb.log({"image_sample": image_log})
-
+                
+            if step % 5000 == 0 and step != 0:
+                save_paramdict_pickle(
+                    model,
+                    f"checks/microdit-train_step-{step}_epoch-{epoch}.pkl",
+                )
+                print(f"midstep checkpoint @ {step}")
+                
             jax.clear_caches()
             gc.collect()
 
@@ -378,14 +391,14 @@ def trainer(epochs, model, optimizer, train_loader):
         save_paramdict_pickle(model, path)
 
         print(f"sampling from...{sample_captions}")
-        epoch_file = sample_image_batch(step, model, sample_textembed)
+        epoch_file = sample_image_batch(step, model, main_batch)
         epoch_image_log = wandb.Image(epoch_file)
         wandb.log({"epoch_sample": epoch_image_log})
 
     etime = time.time() - stime
     print(f"training time for {epochs} epochs -> {etime/60/60:.4f} hours")
 
-    final_sample = sample_image_batch(step, model, sample_textembed)
+    final_sample = sample_image_batch(step, model, main_batch)
     train_image_log = wandb.Image(final_sample)
     wandb.log({"final_sample": train_image_log})
 
