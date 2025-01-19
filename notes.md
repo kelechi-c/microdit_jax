@@ -54,6 +54,15 @@ state = jax.device_get(state)
 nnx.update((model, optimizer), state)
 ```
 
-2. Small models can learn basic structures in the image. So I used them for testing. And smaller models(~80m params) work well on faces...not so well for others.
+2. **Small models** can learn basic structures in the image. So I used them for testing(~80m-size models work well on faces, as faces have a unified structure...not so well for more complex images, need 150m params or more ig). No need for big models if you wanna get basic generations.
 
-3. Initialize model properly (xavier for linear layer weights, zero constant for biases) for stable training.
+3. **Initialize model properly** (xavier for linear layer weights, zero constant for biases) for stable training. I had exploding gradient issues even with small models due to poor initialization.
+
+4. I think, for my experiments, and judging from my failed runs,
+it's best to use **shallow,wide** networks(if we are to maintain same parameter count) over **deep, thin** networks.
+My small **1152-wide, 6-layer** models learnt image structure and learnt better with less steps, 
+than **512-wide, 16-layer** deep networks(plus deeper networks are so slow)
+
+5. **TPU optimizations**
+Main article - [**Cloud TPU performance guide**](https://cloud.google.com/tpu/docs/performance-guide)
+For example, I use 64 batch size and 1024 feature dims, or just multiples of 128/8 
