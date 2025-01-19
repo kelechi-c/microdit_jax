@@ -196,11 +196,12 @@ def device_get_model(model):
 
 def sample_image_batch(step, model, batch):
     labels, shape, ground_latents, captions = (
-        batch["text_embedding"],
-        batch["vae_latent_shape"],
-        batch["vae_latent"],
-        batch['captions']
+        batch["text_embedding"][:9],
+        batch["vae_latent_shape"][:9],
+        batch["vae_latent"][:9],
+        batch["captions"][:9],
     )
+    
     # print(shape)
     start_noise = jrand.normal(randkey, (len(labels), shape[1], shape[2], shape[0]))
     print(f"sampling from noise of shape {start_noise.shape} / captions {captions}")
@@ -221,7 +222,7 @@ def sample_image_batch(step, model, batch):
     del pred_model
     jax.clear_caches()
     gc.collect()
-    
+
     v_sample_error = v_sample_error.mean()
 
     print(f"sample_error {v_sample_error}")
@@ -333,32 +334,36 @@ def trainer(epochs, model, optimizer, train_loader):
     model.train()
 
     batch = next(iter(train_loader))
-    print("initial sample..")
-    gridfile, sample_error = sample_image_batch("initial", model, batch)
-    
-    # wandb_logger(
-    #     key="",
-    #     project_name="microdit",
-    # )
+    # print("initial sample..")
+    # gridfile, sample_error = sample_image_batch("initial", model, batch)
+
+    # test checkpointing
+    # save_paramdict_pickle(model, 'checks/test.pkl')
+    # print(f'testing checkpoint saved')
+
+    wandb_logger(
+        key="",
+        project_name="microdit",
+        run_name='microdit-tiny-v1'
+    )
 
     stime = time.time()
     sample_captions = None
-    sample_textembed = None
     main_batch = None
+    steps_per_epoch = len(train_loader) // train_loader.batch_size
 
     for epoch in tqdm(range(epochs), desc="Training..../"):
-        print(f'training for the {epoch+1}th epoch')
-        
-        for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+        print(f"training for the {epoch+1}th epoch")
+
+        for step, batch in tqdm(enumerate(train_loader), total=len(train_loader)//train_loader.batch_size):
             main_batch = batch
-            sample_captions = batch['caption']
-            sample_textembed = batch['text_embedding']
+            sample_captions = batch["caption"]
 
             latent, text_embed = batch["vae_latent"], batch["text_embedding"]
-            
-            train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)            
+
+            train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
             print(
-                f"step {step}/{len(train_loader)}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
+                f"step {step}/{len(train_loader)//train_loader.batch_size}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
             )
 
             wandb.log(
@@ -370,28 +375,28 @@ def trainer(epochs, model, optimizer, train_loader):
                 }
             )
 
-            if step % 100 == 0 and step != 0:
+            if step % 50 == 0:
                 print(f"sampling from...{sample_captions}")
-                gridfile = sample_image_batch(step, model, sample_textembed)
+                gridfile, _ = sample_image_batch(step, model, batch)
                 image_log = wandb.Image(gridfile)
                 wandb.log({"image_sample": image_log})
-                
+
             if step % 5000 == 0 and step != 0:
                 save_paramdict_pickle(
                     model,
-                    f"checks/microdit-train_step-{step}_epoch-{epoch}.pkl",
+                    f"checks/epoch-{epoch}_microdit-cc-train_step-{step}.pkl",
                 )
                 print(f"midstep checkpoint @ {step}")
-                
+
             jax.clear_caches()
             gc.collect()
 
         print(f"epoch {epoch+1}, train loss => {train_loss}")
-        path = f"{epoch}_microdit_cc_{train_loss}.pkl"
+        path = f"{epoch}_microdit_cc_{train_loss:.4f}.pkl"
         save_paramdict_pickle(model, path)
 
         print(f"sampling from...{sample_captions}")
-        epoch_file = sample_image_batch(step, model, main_batch)
+        epoch_file, _ = sample_image_batch(step, model, main_batch)
         epoch_image_log = wandb.Image(epoch_file)
         wandb.log({"epoch_sample": epoch_image_log})
 
@@ -404,8 +409,9 @@ def trainer(epochs, model, optimizer, train_loader):
 
     save_paramdict_pickle(
         model,
-        f"checks/microdit_cc_step-{len(train_loader)*epochs}_floss-{train_loss:.5f}.pkl",
+        f"checks/microdit_cc_step-trained4epochs{epochs}-{len(train_loader)*epochs}_floss-{train_loss:.5f}.pkl",
     )
+    print(f'training on common-canvas split, for {len(train_loader)} steps complete')
 
     return model
 
