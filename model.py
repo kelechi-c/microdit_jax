@@ -1,3 +1,4 @@
+from functools import partial
 import jax, math
 from jax import Array, numpy as jnp, random as jrand
 from einops import rearrange
@@ -10,6 +11,12 @@ class config:
     lr = 1e-4
     mask_ratio = 0.0
     vaescale_factor = 0.13025
+    
+class model_config:
+    width = 1152
+    depth = 6
+    patchmixer_layers = 2
+    experts = 2
 
 
 rkey = jrand.key(config.seed)
@@ -832,7 +839,7 @@ class MicroDiT(nnx.Module):
         if mask_ratio > 0:
             x = unmask_tokens(x, ids_restore, self.mask_token)
 
-        x = self._unpatchify(x)
+        x = self._unpatchify(x, self.patch_size, height, width)
 
         return x, mask
 
@@ -889,7 +896,6 @@ class RectFlowWrapper(nnx.Module):
 
         return loss
 
-
     def sample(self, z_latent, cond, sample_steps=100, cfg=2.0):
         b_size = z_latent.shape[0]
         dt = 1.0 / sample_steps
@@ -901,7 +907,7 @@ class RectFlowWrapper(nnx.Module):
 
         for step in tqdm(range(sample_steps, 0, -1)):
             t = step / sample_steps
-            t = jnp.array([t] * b_size, device=z_latent.device).astype(jnp.bfloat16)
+            t = jnp.array([t] * b_size).astype(jnp.bfloat16)
 
             vcond, _ = self.model(z_latent, t, cond, mask_ratio=0.0)
 
@@ -914,3 +920,64 @@ class RectFlowWrapper(nnx.Module):
             images.append(z_latent)
 
         return images[-1] / config.vaescale_factor
+
+
+class FlowWrapper(nnx.Module):
+    def __init__(self, model, mask_ratio):
+        self.model = model
+        self.mask_ratio = mask_ratio
+        
+    def __call__(self, x: Array, c: Array) -> Array:
+        img_latents, cond = x, c
+
+        img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
+        img_latents = rearrange(img_latents, "b c h w -> b h w c") # jax uses channels-last format
+
+        # img_latents, labels = jax.device_put((img_latents, cond), jax.devices()[0])
+
+        x_1, c = img_latents, cond  # reassign to more concise variables
+        bs = x_1.shape[0]
+
+        x_0 = jrand.normal(randkey, x_1.shape)  # noise
+        t = jrand.uniform(randkey, (bs,))
+        t = nnx.sigmoid(t)
+
+        inshape = [1] * len(x_1.shape[1:])
+        t_exp = t.reshape([bs, *(inshape)])
+
+        x_t = (1 - t_exp) * x_0 + t_exp * x_1
+        dx_t = x_1 - x_0  # actual vector/velocity difference
+
+        vtheta = self.model(x_t, t, c, mask_ratio=self.mask_ratio)  # model vector prediction
+
+        mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
+        mean_square = (dx_t - vtheta) ** 2  # squared difference/error
+        batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
+        loss = jnp.mean(batchwise_mse_loss)
+
+        return loss
+
+
+    def flow_step(self, x_t: Array, cond: Array, t_start: float, t_end: float) -> Array:
+        """Performs a single flow step using Euler's method."""
+        t_mid = (t_start + t_end) / 2.0
+        # Broadcast t_mid to match x_t's batch dimension
+        t_mid = jnp.full((x_t.shape[0],), t_mid)
+        # Evaluate the vector field at the midpoint
+        v_mid = self.model(x=x_t, y_cap=cond, t=t_mid)
+        # Update x_t using Euler's method
+        x_t_next = x_t + (t_end - t_start) * v_mid
+        
+        return x_t_next
+
+    def sample(self, label: Array, num_steps: int = 50):
+        """Generates samples using flow matching."""
+        time_steps = jnp.linspace(0.0, 1.0, num_steps + 1)
+        x_t = jax.random.normal(randkey, (len(label), 32, 32, 4))  # important change
+
+        for k in tqdm(range(num_steps), desc="Sampling images"):
+            x_t = self.flow_step(
+                x_t=x_t, cond=label, t_start=time_steps[k], t_end=time_steps[k + 1]
+            )
+
+        return x_t / config.vaescale_factor
