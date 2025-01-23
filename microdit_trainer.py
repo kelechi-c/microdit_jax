@@ -162,20 +162,6 @@ class ShapeBatchingDataset(IterableDataset):
         return self.split_size #len(self.dataset) // self.batch_size
 
 
-# def jax_collate(batch):
-#     latents = jnp.stack(
-#         [jnp.array(item["vae_latent"], dtype=jnp.bfloat16) for item in batch], axis=0
-#     )
-#     labels = jnp.stack(
-#         [jnp.array(item["text_embedding"], dtype=jnp.bfloat16) for item in batch],
-#         axis=0,
-#     )
-#     shape = [item["vae_latent_shape"] for item in batch]
-#     shape = [item["vae_latent_shape"] for item in batch]
-
-#     return {"vae_output": latents, "label": labels, "vae_latent_shape": shape}
-
-
 def wandb_logger(key: str, project_name, run_name=None):  # wandb logger
     # initilaize wandb
     wandb.login(key=key)
@@ -199,9 +185,8 @@ def sample_image_batch(step, model, batch):
         batch["text_embedding"][:9],
         batch["vae_latent_shape"][:9],
         batch["vae_latent"][:9],
-        batch["captions"][:9],
+        batch["caption"][:9],
     )
-    
     # print(shape)
     start_noise = jrand.normal(randkey, (len(labels), shape[1], shape[2], shape[0]))
     print(f"sampling from noise of shape {start_noise.shape} / captions {captions}")
@@ -219,6 +204,7 @@ def sample_image_batch(step, model, batch):
 
     gridfile = image_grid(batch, file)
     print(f"sample saved @ {gridfile}")
+    
     del pred_model
     jax.clear_caches()
     gc.collect()
@@ -314,7 +300,6 @@ def train_step(model, optimizer, image, text):
         img_latents = (
             rearrange(img_latents, "b c h w -> b h w c") * config.vaescale_factor
         )
-        # img_latents, label = jax.device_put((img_latents, label), data_sharding)
         loss = model(img_latents, label)
 
         return loss
@@ -329,7 +314,7 @@ def train_step(model, optimizer, image, text):
     return loss, grad_norm
 
 
-def trainer(model, optimizer, train_loader, epochs=1):
+def trainer(model, optimizer, train_loader, schedule, epochs=1):
     train_loss = 0.0
     model.train()
 
@@ -337,88 +322,93 @@ def trainer(model, optimizer, train_loader, epochs=1):
     # print("initial sample..")
     # gridfile, sample_error = sample_image_batch("initial", model, batch)
 
+    # test checkpointing
+    # save_paramdict_pickle(model, 'checks/test.pkl')
+    # print(f'testing checkpoint saved')
     steps_per_epoch = len(train_loader) // train_loader.batch_size
 
     wandb_logger(
         key="",
         project_name="microdit",
-        run_name="microdit-tiny-v1",
+        run_name='flow-tiny1152-v1-schedule'
     )
 
     stime = time.time()
     sample_captions = None
-    sample_textembed = None
     main_batch = None
 
-    # for epoch in tqdm(range(epochs), desc="Training..../"):
-    #     print(f"training for the {epoch+1}th epoch")
+    for epoch in tqdm(range(epochs), desc="Training..../"):
+        print(f"training for the {epoch+1}th epoch")
 
-    for step, batch in tqdm(enumerate(train_loader), total=steps_per_epoch):
-        main_batch = batch
-        sample_captions = batch["caption"]
+        for step, batch in tqdm(enumerate(train_loader), total=steps_per_epoch):
+            lr = schedule(step)
+            
+            main_batch = batch
+            sample_captions = batch["caption"]
 
-        latent, text_embed = batch["vae_latent"], batch["text_embedding"]
+            latent, text_embed = batch["vae_latent"], batch["text_embedding"]
 
-        train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
-        print(
-            f"step {step}/{steps_per_epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
-        )
-
-        wandb.log(
-            {
-                "loss": train_loss.item(),
-                "log_loss": math.log10(train_loss.item()),
-                "grad_norm": grad_norm,
-                "log_grad_norm": math.log10(grad_norm + 1e-8),
-            }
-        )
-
-        if step % 50 == 0:
-            # print(f"sampling from...{sample_captions}")
-            gridfile, _ = sample_image_batch(step, model, batch)
-            image_log = wandb.Image(gridfile)
-            wandb.log({"image_sample": image_log})
-
-        if step % 5000 == 0 and step != 0:
-            save_paramdict_pickle(
-                model,
-                f"checks/microdit-cc-train_step-{step}.pkl",
+            train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
+            print(
+                f"step {step}/{steps_per_epoch}, loss-> {train_loss.item():.4f}, grad_norm {grad_norm}"
             )
-            print(f"midepoch checkpoint @ {step}")
 
-        jax.clear_caches()
-        gc.collect()
+            wandb.log(
+                {
+                    "loss": train_loss.item(),
+                    "log_loss": math.log10(train_loss.item()),
+                    "grad_norm": grad_norm,
+                    "log_grad_norm": math.log10(grad_norm + 1e-8),
+                    "lr": lr
+                }
+            )
 
-    # print(f"epoch {epoch+1}, train loss => {train_loss}")
-    path = f"microdit_cc_{steps_per_epoch}_{train_loss:.4f}.pkl"
-    save_paramdict_pickle(model, path)
+            if step % 50 == 0:
+                # print(f"sampling from...{sample_captions}")
+                gridfile, _ = sample_image_batch(step, model, batch)
+                image_log = wandb.Image(gridfile)
+                wandb.log({"image_sample": image_log})
 
-    print(f"sampling from...{sample_captions}")
-    epoch_file, _ = sample_image_batch(step, model, main_batch)
-    epoch_image_log = wandb.Image(epoch_file)
-    wandb.log({"epoch_sample": epoch_image_log})
+            if step % 5000 == 0 and step != 0:
+                save_paramdict_pickle(
+                    model,
+                    f"checks/microdit-cc-train_step-{step}.pkl",
+                )
+                print(f"midepoch checkpoint @ {step}")
 
-    etime = time.time() - stime
-    print(f"training time for {epochs} epochs -> {etime/60/60:.4f} hours")
+            jax.clear_caches()
+            gc.collect()
 
-    # final_sample = sample_image_batch(step, model, main_batch)
-    # train_image_log = wandb.Image(final_sample)
-    # wandb.log({"final_sample": train_image_log})
+        # print(f"epoch {epoch+1}, train loss => {train_loss}")
+        path = f"microdit_cc_{steps_per_epoch}_{train_loss:.4f}.pkl"
+        save_paramdict_pickle(model, path)
+
+        print(f"sampling from...{sample_captions}")
+        epoch_file, _ = sample_image_batch(step, model, main_batch)
+        epoch_image_log = wandb.Image(epoch_file)
+        wandb.log({"epoch_sample": epoch_image_log})
+
+        etime = time.time() - stime
+        print(f"training time for {epochs} epochs -> {etime/60/60:.4f} hours")
+
+    final_sample = sample_image_batch(step, model, main_batch)
+    train_image_log = wandb.Image(final_sample)
+    wandb.log({"final_sample": train_image_log})
 
     save_paramdict_pickle(
         model,
         f"checks/microdit_cc_step-trained4epochs{epochs}-{steps_per_epoch*epochs}_floss-{train_loss:.5f}.pkl",
     )
-    print(
-        f"training on common-canvas split, for {steps_per_epoch*epochs} steps complete"
-    )
+    print(f'training on common-canvas split, for {steps_per_epoch*epochs} steps complete')
 
     return model
 
 
-def overfit(epochs, model, optimizer, train_loader):
+
+def overfit(epochs, model, optimizer, train_loader, schedule):
     train_loss = 0.0
     model.train()
+    
 
     batch = next(iter(train_loader))
     # print("initial sample..")
@@ -433,6 +423,8 @@ def overfit(epochs, model, optimizer, train_loader):
 
     print("start overfitting.../")
     for epoch in tqdm(range(epochs)):
+        lr = schedule(epoch)
+        
         latent, text_embed = batch["vae_latent"], batch["text_embedding"]
         train_loss, grad_norm = train_step(model, optimizer, latent, text_embed)
         print(
@@ -445,6 +437,7 @@ def overfit(epochs, model, optimizer, train_loader):
                 "log_loss": math.log10(train_loss.item() + 1e-8),
                 "grad_norm": grad_norm.item(),
                 "log_grad_norm": math.log10(grad_norm.item() + 1e-8),
+                "lr": lr
             }
         )
 
@@ -532,7 +525,7 @@ def main(run, epochs, batch_size, mask_ratio):
     print(f"model parameters count: {n_params/1e6:.2f}M")
 
     initial_learning_rate = 3e-4
-    decay_steps = 1000
+    decay_steps = epochs
     end_learning_rate = 1e-5
     power = 1  # Degree of the polynomial
 
@@ -554,7 +547,7 @@ def main(run, epochs, batch_size, mask_ratio):
     # nnx.update((rf_engine, optimizer), state)
 
     if run == "overfit":
-        model, loss = overfit(epochs, rf_engine, optimizer, train_loader)
+        model, loss = overfit(epochs, rf_engine, optimizer, train_loader, schedule)
         wandb.finish()
         print(f"microdit overfitting ended at loss {loss:.4f}")
 
