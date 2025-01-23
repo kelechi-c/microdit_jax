@@ -1,4 +1,4 @@
-### notes....on my tiny video generation model
+### notes....on my tiny image generation model
 So basically, it took me like _weeks_ to port **MicroDiT** to **JAX[w/Flax NNX]**, at least to a _trainable_ version(took that time to actually learn **JAX/TPU** usage lmao). But I learnt a lot(about models, architectures, optimizations, training, deep learning madness/quirks, etc), and can finally call myself an intern level researcher, haha.
 
 Thanks to Google for the **TRC grant**.
