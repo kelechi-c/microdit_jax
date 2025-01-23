@@ -11,7 +11,7 @@ class config:
     lr = 1e-4
     mask_ratio = 0.0
     vaescale_factor = 0.13025
-    
+
 class model_config:
     width = 1152
     depth = 6
@@ -922,18 +922,14 @@ class RectFlowWrapper(nnx.Module):
         return images[-1] / config.vaescale_factor
 
 
+# wrapper for flow matching loss and sampling
 class FlowWrapper(nnx.Module):
     def __init__(self, model, mask_ratio):
         self.model = model
         self.mask_ratio = mask_ratio
-        
+
     def __call__(self, x: Array, c: Array) -> Array:
         img_latents, cond = x, c
-
-        img_latents = img_latents.reshape(-1, 4, 32, 32) * config.vaescale_factor
-        img_latents = rearrange(img_latents, "b c h w -> b h w c") # jax uses channels-last format
-
-        # img_latents, labels = jax.device_put((img_latents, cond), jax.devices()[0])
 
         x_1, c = img_latents, cond  # reassign to more concise variables
         bs = x_1.shape[0]
@@ -948,14 +944,22 @@ class FlowWrapper(nnx.Module):
         x_t = (1 - t_exp) * x_0 + t_exp * x_1
         dx_t = x_1 - x_0  # actual vector/velocity difference
 
-        vtheta = self.model(x_t, t, c, mask_ratio=self.mask_ratio)  # model vector prediction
+        vtheta, mask = self.model(
+            x_t, t, c, mask_ratio=self.mask_ratio
+        )  # model vector prediction
 
-        mean_dim = list(range(1, len(x_1.shape)))  # across all dimensions except the batch dim
+        mean_dim = list(
+            range(1, len(x_1.shape))
+        )  # across all dimensions except the batch dim
         mean_square = (dx_t - vtheta) ** 2  # squared difference/error
         batchwise_mse_loss = jnp.mean(mean_square, axis=mean_dim)  # mean loss
         loss = jnp.mean(batchwise_mse_loss)
 
-        return loss
+        if self.mask_ratio > 0:
+            unmask = 1 - mask
+            loss = (loss * unmask).sum(axis=1) / unmask.sum(axis=1)
+
+        return loss.mean()
 
 
     def flow_step(self, x_t: Array, cond: Array, t_start: float, t_end: float) -> Array:
@@ -964,16 +968,17 @@ class FlowWrapper(nnx.Module):
         # Broadcast t_mid to match x_t's batch dimension
         t_mid = jnp.full((x_t.shape[0],), t_mid)
         # Evaluate the vector field at the midpoint
-        v_mid = self.model(x=x_t, y_cap=cond, t=t_mid)
+        v_mid, _ = self.model(x=x_t, y_cap=cond, t=t_mid)
         # Update x_t using Euler's method
+        # print(f'{type(x_t) = } / {type(v_mid)}')
         x_t_next = x_t + (t_end - t_start) * v_mid
-        
+
         return x_t_next
 
-    def sample(self, label: Array, num_steps: int = 50):
+    def sample(self, x_t, label: Array, num_steps: int = 50):
         """Generates samples using flow matching."""
         time_steps = jnp.linspace(0.0, 1.0, num_steps + 1)
-        x_t = jax.random.normal(randkey, (len(label), 32, 32, 4))  # important change
+        # x_t = jax.random.normal(randkey, (len(label), 32, 32, 4))  # important change
 
         for k in tqdm(range(num_steps), desc="Sampling images"):
             x_t = self.flow_step(
