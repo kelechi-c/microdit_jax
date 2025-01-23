@@ -404,17 +404,13 @@ def trainer(model, optimizer, train_loader, schedule, epochs=1):
     return model
 
 
-
 def overfit(epochs, model, optimizer, train_loader, schedule):
     train_loss = 0.0
     model.train()
     
 
     batch = next(iter(train_loader))
-    # print("initial sample..")
-    # gridfile, sample_error = sample_image_batch("initial", model, batch)
-    # print(f'initial sample error: {sample_error.mean()}')
-
+    
     wandb_logger(
         key="yourkey", project_name="microdit_overfit"
     )
@@ -446,29 +442,13 @@ def overfit(epochs, model, optimizer, train_loader, schedule):
             image_log = wandb.Image(gridfile)
             wandb.log({"image_sample": image_log, "sample_error": sample_error})
 
-        if epoch % 400 == 0 and epoch != 0:
-            save_paramdict_pickle(
-                model,
-                f"checks/microdit-moe_overfitting_step-{epoch}.pkl",
-            )
-            print(f"checkpoint @ {epoch}")
-
         jax.clear_caches()
         gc.collect()
 
     etime = time.time() - stime
-    save_paramdict_pickle(
-        model,
-        f"checks/microdit_overfitting_all{epochs}.pkl",
-    )
     print(
         f"overfit time for {epochs} epochs -> {etime/60:.4f} mins / {etime/60/60:.4f} hrs"
     )
-
-    epoch_file, sample_error = sample_image_batch("overfit", model, batch)
-    epoch_image_log = wandb.Image(epoch_file)
-    wandb.log({"epoch_sample": epoch_image_log, "overfit_sample_error": sample_error})
-
     return model, train_loss
 
 
@@ -484,21 +464,12 @@ def log_state_values(state_layer):
 # wandb.Tab
 @click.command()
 @click.option("-r", "--run", default="overfit")
-@click.option("-e", "--epochs", default=30)
+@click.option("-e", "--epochs", default=5)
 @click.option("-mr", "--mask_ratio", default=config.mask_ratio)
 @click.option("-bs", "--batch_size", default=config.batch_size)
 def main(run, epochs, batch_size, mask_ratio):
 
-    dataset = ShapeBatchingDataset(batch_size=batch_size)
-
-    train_loader = dataset
-    # train_loader = DataLoader(
-    #     dataset,
-    #     batch_size=batch_size,
-    #     num_workers=0,
-    #     drop_last=True,
-    #     collate_fn=jax_collate,
-    # )
+    train_loader = ShapeBatchingDataset(batch_size=batch_size)
 
     sp = next(iter(train_loader))
     print(
@@ -510,12 +481,12 @@ def main(run, epochs, batch_size, mask_ratio):
     microdit = MicroDiT(
         in_channels=4,
         patch_size=(2, 2),
-        embed_dim=1024,
-        num_layers=6,
+        embed_dim=1152,
+        num_layers=4,
         attn_heads=16,
         patchmix_layers=4,
-        patchmix_dim=1024,
-        num_experts=4
+        patchmix_dim=1152,
+        num_experts=8,
     )
 
     rf_engine = RectFlowWrapper(microdit, mask_ratio=mask_ratio)
@@ -525,27 +496,23 @@ def main(run, epochs, batch_size, mask_ratio):
     print(f"model parameters count: {n_params/1e6:.2f}M")
 
     initial_learning_rate = 3e-4
-    decay_steps = epochs
     end_learning_rate = 1e-5
-    power = 1  # Degree of the polynomial
+    power = 1  # setting this to 1 makes it a linear schedule
 
     schedule = optax.polynomial_schedule(
         init_value=initial_learning_rate,
         end_value=end_learning_rate,
         power=power,
-        transition_steps=decay_steps,
+        transition_steps=5000,
     )
 
     optimizer = nnx.Optimizer(
         rf_engine,
-        optax.adamw(schedule, b1=0.9, b2=0.999, eps=1e-9, weight_decay=0.1),
-        # optax.adamw(learning_rate=2e-4, weight_decay=0.1),
+        optax.chain(
+            optax.clip_by_global_norm(1.0),
+            optax.adamw(schedule, b1=0.9, b2=0.995, eps=1e-9, weight_decay=0.001),
+        ),
     )
-    # replicate model across devices
-    # state = nnx.state((rf_engine, optimizer))
-    # state = jax.device_put(state, rep_sharding)
-    # nnx.update((rf_engine, optimizer), state)
-
     if run == "overfit":
         model, loss = overfit(epochs, rf_engine, optimizer, train_loader, schedule)
         wandb.finish()
